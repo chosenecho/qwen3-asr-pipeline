@@ -27,6 +27,7 @@ DATA_DIR = REPO_ROOT / "data"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 DB_PATH = DATA_DIR / "pipeline.db"
 DEFAULT_OUT_DIR = REPO_ROOT / "release_dist"
+DEFAULT_MAX_PART_RAW_MB = 450  # ~80-90 MB compressed for JSON/text, avoids long TCP resets
 GITHUB_ASSET_LIMIT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB hard GitHub limit
 
 
@@ -146,6 +147,33 @@ def collect_group_files(group: str, exts: set[str]) -> list[tuple[Path, str]]:
     return result
 
 
+def partition_files(
+    files: list[tuple[Path, str]],
+    max_raw_bytes: int,
+) -> list[list[tuple[Path, str]]]:
+    """Split files into standalone chunks so each archive stays fast and upload-safe."""
+    if not files:
+        return []
+    sized = [(src, arc, src.stat().st_size) for src, arc in files]
+    total_raw = sum(sz for _, _, sz in sized)
+    if max_raw_bytes <= 0 or total_raw <= max_raw_bytes:
+        return [files]
+
+    chunks: list[list[tuple[Path, str]]] = []
+    cur: list[tuple[Path, str]] = []
+    cur_bytes = 0
+    for src, arc, sz in sized:
+        if cur and cur_bytes + sz > max_raw_bytes:
+            chunks.append(cur)
+            cur = []
+            cur_bytes = 0
+        cur.append((src, arc))
+        cur_bytes += sz
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def package_artifacts(
     out_dir: Path,
     groups: list[str],
@@ -153,19 +181,38 @@ def package_artifacts(
     include_db: bool = True,
     sanitize_db: bool = True,
     compresslevel: int = 6,
+    max_part_raw_mb: int = DEFAULT_MAX_PART_RAW_MB,
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
+    for stale in list(out_dir.glob("*.tar.gz")) + [
+        out_dir / "MANIFEST.json",
+        out_dir / "SHA256SUMS.txt",
+        out_dir / "RELEASE_NOTES.md",
+    ]:
+        stale.unlink(missing_ok=True)
+
+    max_raw_bytes = max_part_raw_mb * 1024 * 1024 if max_part_raw_mb > 0 else 0
     started = time.time()
     assets: list[dict] = []
 
-    print(f"Packaging groups: {', '.join(groups)} -> {out_dir}")
-    for group in groups:
-        # 1. Text & subtitles (.txt, .srt)
-        text_files = collect_group_files(group, {".txt", ".srt"})
-        if text_files:
-            arc = out_dir / f"{group}-text.tar.gz"
+    print(
+        f"Packaging groups: {', '.join(groups)} -> {out_dir} "
+        f"(max_part_raw={max_part_raw_mb} MB)"
+    )
+
+    def pack_bucket(
+        group: str,
+        stem: str,
+        kind: str,
+        bucket_files: list[tuple[Path, str]],
+    ) -> None:
+        chunks = partition_files(bucket_files, max_raw_bytes)
+        multi = len(chunks) > 1
+        for i, chunk in enumerate(chunks, 1):
+            arc_name = f"{stem}-part{i:02d}.tar.gz" if multi else f"{stem}.tar.gz"
+            arc = out_dir / arc_name
             t0 = time.time()
-            cnt, raw_b = build_tar_gz(arc, text_files, compresslevel=compresslevel)
+            cnt, raw_b = build_tar_gz(arc, chunk, compresslevel=compresslevel)
             comp_b = arc.stat().st_size
             digest = sha256_file(arc)
             print(
@@ -176,7 +223,8 @@ def package_artifacts(
                 {
                     "name": arc.name,
                     "group": group,
-                    "kind": "text+srt",
+                    "kind": kind,
+                    "part": f"{i}/{len(chunks)}" if multi else None,
                     "files": cnt,
                     "raw_bytes": raw_b,
                     "archive_bytes": comp_b,
@@ -184,30 +232,17 @@ def package_artifacts(
                 }
             )
 
+    for group in groups:
+        # 1. Text & subtitles (.txt, .srt)
+        text_files = collect_group_files(group, {".txt", ".srt"})
+        if text_files:
+            pack_bucket(group, f"{group}-text", "text+srt", text_files)
+
         # 2. Word-level JSON (.json)
         if include_json:
             json_files = collect_group_files(group, {".json"})
             if json_files:
-                arc = out_dir / f"{group}-json.tar.gz"
-                t0 = time.time()
-                cnt, raw_b = build_tar_gz(arc, json_files, compresslevel=compresslevel)
-                comp_b = arc.stat().st_size
-                digest = sha256_file(arc)
-                print(
-                    f"  [OK] {arc.name}: {cnt} files, {format_size(raw_b)} -> {format_size(comp_b)} "
-                    f"({time.time() - t0:.1f}s)"
-                )
-                assets.append(
-                    {
-                        "name": arc.name,
-                        "group": group,
-                        "kind": "word-json",
-                        "files": cnt,
-                        "raw_bytes": raw_b,
-                        "archive_bytes": comp_b,
-                        "sha256": digest,
-                    }
-                )
+                pack_bucket(group, f"{group}-json", "word-json", json_files)
 
     # 3. Clean SQLite snapshot
     if include_db and DB_PATH.is_file():
@@ -325,12 +360,12 @@ def publish_release(
         text=True,
         encoding="utf-8",
     )
-    existing_sizes: dict[str, int] = {}
+    existing_assets: dict[str, dict] = {}
     if check.returncode == 0:
         data = json.loads(check.stdout or "{}")
         for asset in data.get("assets", []):
-            existing_sizes[asset["name"]] = int(asset.get("size", -1))
-        print(f"Release {tag} exists ({len(existing_sizes)} assets already uploaded); updating notes...")
+            existing_assets[asset["name"]] = asset
+        print(f"Release {tag} exists ({len(existing_assets)} assets already uploaded); updating notes...")
         subprocess.run(
             ["gh", "release", "edit", tag, "--notes-file", str(notes_file)],
             cwd=str(REPO_ROOT),
@@ -352,14 +387,18 @@ def publish_release(
             cmd.append("--draft")
         subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
 
-    # 2. Upload assets sequentially (smallest first) with resume + retry
+    # 2. Upload assets sequentially (smallest first) with digest-verified resume + retry
     ordered_files = sorted(upload_files, key=lambda p: p.stat().st_size)
     total = len(ordered_files)
     for idx, path in enumerate(ordered_files, 1):
         size = path.stat().st_size
-        if existing_sizes.get(path.name) == size:
-            print(f"  [{idx}/{total}] SKIP (already uploaded) {path.name} ({format_size(size)})")
-            continue
+        remote = existing_assets.get(path.name)
+        if remote:
+            remote_digest = (remote.get("digest") or "").lower()
+            local_digest = f"sha256:{sha256_file(path)}"
+            if remote_digest and remote_digest == local_digest:
+                print(f"  [{idx}/{total}] SKIP (digest verified) {path.name} ({format_size(size)})")
+                continue
         for attempt in range(1, max_retries + 1):
             t0 = time.time()
             print(
@@ -430,6 +469,12 @@ def main() -> int:
             help="Keep server URLs / run params inside exported pipeline.db",
         )
         p.add_argument("--level", type=int, default=6, choices=range(1, 10))
+        p.add_argument(
+            "--max-part-raw-mb",
+            type=int,
+            default=DEFAULT_MAX_PART_RAW_MB,
+            help=f"Split large buckets into standalone archives <= N MB raw (default: {DEFAULT_MAX_PART_RAW_MB}, 0=disable)",
+        )
 
     p_pack = sub.add_parser("package", help="Package transcript artifacts locally")
     add_pack_args(p_pack)
@@ -465,6 +510,7 @@ def main() -> int:
             include_db=not args.no_db,
             sanitize_db=not args.no_sanitize_db,
             compresslevel=args.level,
+            max_part_raw_mb=args.max_part_raw_mb,
         )
         return 0
 
@@ -486,6 +532,7 @@ def main() -> int:
                 include_db=not args.no_db,
                 sanitize_db=not args.no_sanitize_db,
                 compresslevel=args.level,
+                max_part_raw_mb=args.max_part_raw_mb,
             )
         publish_release(
             out_dir=args.out_dir,

@@ -125,7 +125,7 @@ export ASR_MODAL_INCLUDE_WORDS="true"
 为保持 Git 仓库轻量清晰，所有二进制与大体积产物均不提交到 Git，而是按分组打包并挂载到 [GitHub Releases](../../releases)：
 
 - `<group>-text.tar.gz`：该分组的 `.txt` 纯文本与 `.srt` 字幕
-- `<group>-json.tar.gz`：该分组的词级时间戳原始 `.json`（如该分组启用了 `--save-json`）
+- `<group>-json.tar.gz`（大分组自动按原始体积拆分为多个独立 `<group>-json-partXX.tar.gz`，每包约 80 MB）：该分组的词级时间戳原始 `.json`（如该分组启用了 `--save-json`）
 - `pipeline-db.tar.gz`：经过 WAL checkpoint 的干净 `data/pipeline.db` 快照
 - `MANIFEST.json` 与 `SHA256SUMS.txt`：各分组文件计数、体积清单与 SHA-256 校验和
 
