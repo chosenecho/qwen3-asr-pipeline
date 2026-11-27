@@ -1,0 +1,9 @@
+data/
+release_dist/
+.env
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+
