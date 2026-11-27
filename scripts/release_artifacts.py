@@ -302,6 +302,7 @@ def publish_release(
     title: str | None,
     manifest: dict,
     draft: bool = False,
+    max_retries: int = 5,
 ) -> None:
     if not shutil.which("gh"):
         raise RuntimeError("GitHub CLI (`gh`) not found in PATH.")
@@ -316,25 +317,27 @@ def publish_release(
     notes_file = out_dir / "RELEASE_NOTES.md"
     notes_file.write_text(notes, encoding="utf-8")
 
-    # Check if release already exists
+    # 1. Ensure release exists (create metadata-only first so partial upload never rolls back)
     check = subprocess.run(
-        ["gh", "release", "view", tag],
+        ["gh", "release", "view", tag, "--json", "assets"],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
+    existing_sizes: dict[str, int] = {}
     if check.returncode == 0:
-        print(f"Release {tag} exists; uploading assets with --clobber...")
-        cmd = ["gh", "release", "upload", tag, "--clobber"] + [str(p) for p in upload_files]
-        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+        data = json.loads(check.stdout or "{}")
+        for asset in data.get("assets", []):
+            existing_sizes[asset["name"]] = int(asset.get("size", -1))
+        print(f"Release {tag} exists ({len(existing_sizes)} assets already uploaded); updating notes...")
         subprocess.run(
             ["gh", "release", "edit", tag, "--notes-file", str(notes_file)],
             cwd=str(REPO_ROOT),
             check=True,
         )
     else:
-        print(f"Creating release {tag} and uploading {len(upload_files)} assets...")
+        print(f"Creating release {tag}...")
         cmd = [
             "gh",
             "release",
@@ -347,8 +350,34 @@ def publish_release(
         ]
         if draft:
             cmd.append("--draft")
-        cmd.extend(str(p) for p in upload_files)
         subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+
+    # 2. Upload assets sequentially (smallest first) with resume + retry
+    ordered_files = sorted(upload_files, key=lambda p: p.stat().st_size)
+    total = len(ordered_files)
+    for idx, path in enumerate(ordered_files, 1):
+        size = path.stat().st_size
+        if existing_sizes.get(path.name) == size:
+            print(f"  [{idx}/{total}] SKIP (already uploaded) {path.name} ({format_size(size)})")
+            continue
+        for attempt in range(1, max_retries + 1):
+            t0 = time.time()
+            print(
+                f"  [{idx}/{total}] Uploading {path.name} ({format_size(size)}) "
+                f"[attempt {attempt}/{max_retries}]..."
+            )
+            res = subprocess.run(
+                ["gh", "release", "upload", tag, str(path), "--clobber"],
+                cwd=str(REPO_ROOT),
+            )
+            if res.returncode == 0:
+                print(f"  [{idx}/{total}] OK {path.name} ({time.time() - t0:.1f}s)")
+                break
+            if attempt == max_retries:
+                raise RuntimeError(f"Failed to upload {path.name} after {max_retries} attempts.")
+            wait_sec = min(30, 5 * attempt)
+            print(f"  [{idx}/{total}] Upload failed (rc={res.returncode}); retrying in {wait_sec}s...")
+            time.sleep(wait_sec)
 
 
 def restore_artifacts(src_dir: Path, dest_root: Path, skip_verify: bool = False) -> None:
