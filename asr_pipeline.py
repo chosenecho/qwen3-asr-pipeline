@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
+import math
 import json
 import mimetypes
 import os
-import queue
 import re
 import shutil
 import signal
@@ -25,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -168,6 +170,119 @@ def probe_duration_sec(file_path: Path) -> float | None:
         return None
 
 
+def stable_fingerprint(value: Any) -> str:
+    raw = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def file_fingerprint(path: Path) -> str:
+    st = path.stat()
+    return stable_fingerprint({"size": st.st_size, "mtime_ns": st.st_mtime_ns})
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def normalize_base_url(url: str) -> str:
+    parts = urllib.parse.urlsplit(url.strip())
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), parts.query, ""))
+
+
+def build_output_paths(root: Path, group: str, relative_path: str, save_json: bool = False) -> dict[str, Path]:
+    relative = Path(relative_path)
+    if relative.is_absolute() or ".." in relative.parts or Path(group).is_absolute() or ".." in Path(group).parts:
+        raise ValueError("Output paths must stay inside the configured root")
+    stem = relative.stem
+    folder = root / group / relative.parent
+    result = {"txt": folder / (stem + ".txt"), "srt": folder / (stem + ".srt"),
+              "marker": folder / ("." + stem + ".complete.json")}
+    if save_json:
+        result["json"] = folder / (stem + ".json")
+    return result
+
+
+class TranscriptStore:
+    """Commit files first and a verifiable completion record last."""
+
+    def __init__(self, paths: dict[str, Path]) -> None:
+        self.paths = paths
+
+    def read_marker(self) -> dict[str, Any] | None:
+        try:
+            marker = json.loads(self.paths["marker"].read_text(encoding="utf-8"))
+            if marker.get("schema_version") != 1 or marker.get("producer") != "python":
+                return None
+            return marker
+        except (OSError, ValueError, AttributeError):
+            return None
+
+    def valid(self, source: str | None, request: str | None) -> bool:
+        marker = self.read_marker()
+        if not marker or not source or not request:
+            return False
+        if marker.get("source_fingerprint") != source or marker.get("request_fingerprint") != request:
+            return False
+        files = marker.get("files")
+        if not isinstance(files, dict) or not {"txt", "srt"}.issubset(files):
+            return False
+        try:
+            for kind, dest in self.paths.items():
+                if kind == "marker":
+                    continue
+                info = files.get(kind)
+                if not isinstance(info, dict) or info.get("name") != dest.name:
+                    return False
+                if not dest.is_file() or dest.stat().st_size != info.get("size") or sha256_file(dest) != info.get("sha256"):
+                    return False
+            # Validate optional files recorded by a previous save-json run too.
+            for kind, info in files.items():
+                if kind not in ("txt", "srt", "json") or not isinstance(info, dict):
+                    return False
+                name = info.get("name")
+                if not isinstance(name, str) or Path(name).name != name:
+                    return False
+                dest = self.paths["marker"].parent / name
+                if not dest.is_file() or dest.stat().st_size != info.get("size") or sha256_file(dest) != info.get("sha256"):
+                    return False
+            return True
+        except (OSError, TypeError, ValueError):
+            return False
+
+    def commit(self, text: str, subtitle: str, payload: Any, source: str, request: str, input_path: str) -> None:
+        self.paths["marker"].parent.mkdir(parents=True, exist_ok=True)
+        contents = {"txt": text + ("\n" if text and not text.endswith("\n") else ""), "srt": subtitle}
+        if "json" in self.paths:
+            contents["json"] = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        staged: list[tuple[Path, Path]] = []
+        files: dict[str, Any] = {}
+        try:
+            for kind, content in contents.items():
+                dest = self.paths[kind]
+                temp = dest.with_name("." + dest.name + "." + uuid.uuid4().hex + ".tmp")
+                staged.append((temp, dest))
+                temp.write_text(content, encoding="utf-8")
+                files[kind] = {"name": dest.name, "size": temp.stat().st_size, "sha256": sha256_file(temp)}
+            # Remove the old commit point before replacing even the first file.
+            self.paths["marker"].unlink(missing_ok=True)
+            for temp, dest in staged:
+                os.replace(temp, dest)
+            marker = {"schema_version": 1, "producer": "python", "source_fingerprint": source,
+                      "request_fingerprint": request, "input_path": input_path, "files": files}
+            dest = self.paths["marker"]
+            temp = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".tmp")
+            staged.append((temp, dest))
+            temp.write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            os.replace(temp, dest)
+        finally:
+            for temp, _ in staged:
+                temp.unlink(missing_ok=True)
+
+
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -184,6 +299,11 @@ CREATE TABLE IF NOT EXISTS media_items (
     video_size_bytes  INTEGER NOT NULL DEFAULT 0,
     video_mtime       REAL NOT NULL DEFAULT 0,
     duration_sec      REAL,
+
+    source_fingerprint TEXT,
+    audio_fingerprint TEXT,
+    asr_fingerprint   TEXT,
+    asr_phase         TEXT,
 
     -- Audio extraction state
     audio_status      TEXT NOT NULL DEFAULT 'pending',
@@ -242,15 +362,52 @@ class StateDB:
         self.db_path = db_path.resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self.conn = sqlite3.connect(
-            str(self.db_path),
-            timeout=30.0,
-            check_same_thread=False,
-        )
+        self.conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        with self._lock:
-            self.conn.executescript(SCHEMA_SQL)
-            self.conn.commit()
+        try:
+            with self._lock:
+                tables = {r[0] for r in self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                self.public_snapshot = False
+                if "snapshot_metadata" in tables:
+                    entry = self.conn.execute("SELECT value FROM snapshot_metadata WHERE key='profile'").fetchone()
+                    self.public_snapshot = bool(entry and entry[0] == "public")
+                if not self.public_snapshot:
+                    version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+                    if version > 1:
+                        raise RuntimeError(f"Database schema {version} is newer than supported schema 1")
+                    if "media_items" in tables:
+                        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(media_items)")}
+                        missing = {"source_fingerprint", "audio_fingerprint", "asr_fingerprint", "asr_phase"} - cols
+                        if version < 1 or missing:
+                            backup_dir = self.db_path.parent / ".migration-backups"
+                            backup_dir.mkdir(exist_ok=True)
+                            backup = backup_dir / (self.db_path.stem + ".pre-v1-" + uuid.uuid4().hex + ".db")
+                            dest = sqlite3.connect(str(backup))
+                            try:
+                                self.conn.backup(dest)
+                            finally:
+                                dest.close()
+                            with self.conn:
+                                self.conn.execute("BEGIN IMMEDIATE")
+                                # Another CLI may have migrated after our online backup.
+                                locked_version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+                                if locked_version > 1:
+                                    raise RuntimeError(f"Database schema {locked_version} is newer than supported schema 1")
+                                locked_cols = {r[1] for r in self.conn.execute("PRAGMA table_info(media_items)")}
+                                for name in sorted({"source_fingerprint", "audio_fingerprint", "asr_fingerprint", "asr_phase"} - locked_cols):
+                                    self.conn.execute(f"ALTER TABLE media_items ADD COLUMN {name} TEXT")
+                                self.conn.execute("PRAGMA user_version=1")
+                    self.conn.executescript(SCHEMA_SQL)
+                    self.conn.execute("PRAGMA user_version=1")
+                    self.conn.commit()
+        except BaseException:
+            self.conn.close()
+            raise
+
+    def require_private(self) -> None:
+        if self.public_snapshot:
+            raise ValueError("Public snapshot is an archive index. Build local state with extract or restore a private backup to a different DB.")
+
 
     def close(self) -> None:
         with self._lock:
@@ -282,44 +439,44 @@ class StateDB:
             self.conn.execute(
                 """
                 UPDATE pipeline_runs
-                SET done_count = ?, failed_count = ?, skipped_count = ?, status = ?, finished_at = ?
+                SET done_count = ?, failed_count = ?, skipped_count = ?, status = ?, finished_at = ?,
+                    total_count = MAX(total_count, ?)
                 WHERE id = ?
                 """,
-                (done_count, failed_count, skipped_count, status, utc_now(), run_id),
+                (done_count, failed_count, skipped_count, status, utc_now(), done_count + failed_count + skipped_count, run_id),
             )
             self.conn.commit()
 
-    def upsert_videos(
-        self,
-        source_group: str,
-        records: list[tuple[str, str, str, str, int, float]],
-    ) -> int:
-        """Upsert discovered video files. Each tuple: (video_id, title, video_path, video_rel_path, size, mtime)."""
+    def upsert_videos(self, source_group: str, records: list[tuple[str, str, str, str, int, float]]) -> int:
+        """Record current inputs; invalidate downstream state only on observed changes."""
+        self.require_private()
         now = utc_now()
-        with self._lock:
-            self.conn.executemany(
-                """
-                INSERT INTO media_items (
-                    source_group, video_id, title, video_path, video_rel_path,
-                    video_size_bytes, video_mtime, created_at, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(video_path) DO UPDATE SET
-                    source_group = excluded.source_group,
-                    video_id = excluded.video_id,
-                    title = excluded.title,
-                    video_rel_path = excluded.video_rel_path,
-                    video_size_bytes = excluded.video_size_bytes,
-                    video_mtime = excluded.video_mtime,
-                    updated_at = excluded.updated_at
-                """,
-                [
-                    (source_group, vid, title, vpath, vrel, vsize, vmtime, now, now)
-                    for (vid, title, vpath, vrel, vsize, vmtime) in records
-                ],
-            )
-            self.conn.commit()
+        with self._lock, self.conn:
+            for vid, title, vpath, vrel, size, mtime in records:
+                try:
+                    fingerprint = file_fingerprint(Path(vpath))
+                except OSError:
+                    fingerprint = stable_fingerprint({"size": size, "mtime_ns": int(mtime * 1_000_000_000)})
+                old = self.conn.execute("SELECT * FROM media_items WHERE video_path=?", (vpath,)).fetchone()
+                if old is None:
+                    self.conn.execute("""INSERT INTO media_items
+                        (source_group,video_id,title,video_path,video_rel_path,video_size_bytes,video_mtime,
+                         source_fingerprint,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (source_group,vid,title,vpath,vrel,size,mtime,fingerprint,now,now))
+                    continue
+                changed = (old["source_fingerprint"] is not None and old["source_fingerprint"] != fingerprint) or old["video_size_bytes"] != size or old["video_mtime"] != mtime
+                # Do not silently bless old completed artifacts whose provenance is unknown.
+                source = fingerprint if changed or old["source_fingerprint"] or old["audio_status"] != "done" else None
+                self.conn.execute("""UPDATE media_items SET source_group=?,video_id=?,title=?,video_rel_path=?,
+                    video_size_bytes=?,video_mtime=?,source_fingerprint=?,updated_at=? WHERE id=?""",
+                    (source_group,vid,title,vrel,size,mtime,source,now,old["id"]))
+                if changed:
+                    self.conn.execute("""UPDATE media_items SET audio_status='pending',audio_fingerprint=NULL,
+                        asr_status='pending',asr_fingerprint=NULL,asr_phase=NULL,asr_task_id=NULL,
+                        asr_progress=0,asr_message='input changed',asr_error=NULL,
+                        txt_path=NULL,srt_path=NULL,json_path=NULL WHERE id=?""", (old["id"],))
         return len(records)
+
 
     def reset_stale_running_audio(self, source_group: str | None = None) -> int:
         now = utc_now()
@@ -423,6 +580,13 @@ class StateDB:
                 """,
                 (preset, str(audio_path), audio_format, audio_size_bytes, duration_sec, now, now, item_id),
             )
+            row = self.conn.execute("SELECT source_fingerprint FROM media_items WHERE id=?", (item_id,)).fetchone()
+            fingerprint = stable_fingerprint({"source": row[0], "preset": preset, "rule": 1,
+                                              "file": file_fingerprint(audio_path)})
+            self.conn.execute("""UPDATE media_items SET audio_fingerprint=?,asr_status='pending',
+                asr_fingerprint=NULL,asr_phase=NULL,asr_task_id=NULL,asr_progress=0,
+                asr_message='audio rebuilt',asr_error=NULL,txt_path=NULL,srt_path=NULL,json_path=NULL WHERE id=?""",
+                (fingerprint,item_id))
             self.conn.commit()
 
     def mark_audio_pending(self, item_id: int) -> None:
@@ -431,8 +595,11 @@ class StateDB:
             self.conn.execute(
                 """
                 UPDATE media_items
-                SET audio_status = 'pending',
-                    audio_error = NULL,
+                SET audio_status = 'pending', audio_fingerprint = NULL,
+                    audio_error = NULL, asr_status = 'pending', asr_fingerprint = NULL,
+                    asr_task_id = NULL, asr_phase = NULL, asr_progress = 0,
+                    asr_error = NULL, asr_message = 'audio unavailable',
+                    txt_path = NULL, srt_path = NULL, json_path = NULL,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -518,7 +685,8 @@ class StateDB:
                 SET asr_status = ?,
                     asr_mode = ?,
                     asr_server_url = ?,
-                    asr_task_id = COALESCE(?, asr_task_id),
+                    asr_task_id = ?,
+                    asr_phase = CASE WHEN ? = 'async' THEN CASE WHEN ? IS NULL THEN 'submitting' ELSE 'polling' END ELSE 'writing' END,
                     asr_progress = ?,
                     asr_message = ?,
                     asr_error = NULL,
@@ -528,7 +696,7 @@ class StateDB:
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (status, mode, server_url, task_id, progress, message, now, now, now, item_id),
+                (status, mode, server_url, task_id, mode, task_id, progress, message, now, now, now, item_id),
             )
             self.conn.commit()
 
@@ -574,6 +742,7 @@ class StateDB:
                 SET asr_status = 'done',
                     asr_progress = 100.0,
                     asr_message = 'completed',
+                    asr_phase = NULL,
                     txt_path = ?,
                     srt_path = ?,
                     json_path = ?,
@@ -613,19 +782,24 @@ class StateDB:
             self.conn.commit()
 
     def reset_items(self, stage: str, statuses: list[str], source_group: str | None = None) -> int:
+        self.require_private()
         now = utc_now()
         placeholders = ",".join("?" for _ in statuses)
         params: list[Any] = [now]
         if stage == "audio":
             sql = f"""
                 UPDATE media_items
-                SET audio_status = 'pending', audio_error = NULL, updated_at = ?
+                SET audio_status = 'pending', audio_error = NULL, audio_fingerprint = NULL,
+                    asr_status = 'pending', asr_fingerprint = NULL, asr_task_id = NULL,
+                    asr_phase = NULL, asr_progress = 0, asr_error = NULL,
+                    asr_message = 'audio reset', txt_path = NULL, srt_path = NULL, json_path = NULL,
+                    updated_at = ?
                 WHERE audio_status IN ({placeholders})
             """
         else:
             sql = f"""
                 UPDATE media_items
-                SET asr_status = 'pending', asr_progress = 0.0, asr_task_id = NULL,
+                SET asr_status = 'pending', asr_progress = 0.0, asr_task_id = NULL, asr_phase = NULL, asr_fingerprint = NULL,
                     asr_message = NULL, asr_error = NULL, updated_at = ?
                 WHERE asr_status IN ({placeholders})
             """
@@ -637,6 +811,46 @@ class StateDB:
             cur = self.conn.execute(sql, params)
             self.conn.commit()
             return cur.rowcount
+
+    def get_item(self, item_id: int) -> sqlite3.Row:
+        with self._lock:
+            return self.conn.execute("SELECT * FROM media_items WHERE id=?", (item_id,)).fetchone()
+
+    def all_items(self, group: str | None = None) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self.conn.execute("SELECT * FROM media_items" + (" WHERE source_group=?" if group else "") + " ORDER BY id", (group,) if group else ()).fetchall())
+
+    def set_asr_phase(self, item_id: int, phase: str | None, *, error: str | None = None) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("UPDATE media_items SET asr_phase=?,asr_error=?,asr_updated_at=?,updated_at=? WHERE id=?",
+                              (phase,error,utc_now(),utc_now(),item_id))
+
+    def set_asr_fingerprint(self, item_id: int, fingerprint: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("UPDATE media_items SET asr_fingerprint=? WHERE id=?", (fingerprint,item_id))
+
+    def invalidate_asr(self, item_id: int, reason: str, *, keep_task: bool = False) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("""UPDATE media_items SET asr_status=?,asr_progress=0,asr_message=?,asr_error=NULL,
+                asr_phase=?,asr_task_id=CASE WHEN ? THEN asr_task_id ELSE NULL END,
+                txt_path=NULL,srt_path=NULL,json_path=NULL,updated_at=? WHERE id=?""",
+                ("running" if keep_task else "pending",reason,"polling" if keep_task else None,keep_task,utc_now(),item_id))
+
+    def invalidate_audio(self, item_id: int, reason: str) -> None:
+        with self._lock, self.conn:
+            self.conn.execute("UPDATE media_items SET audio_status='pending',audio_fingerprint=NULL,audio_error=?,updated_at=? WHERE id=?",
+                              (reason,utc_now(),item_id))
+        self.invalidate_asr(item_id, reason)
+
+    def adopt_legacy(self, item_id: int) -> None:
+        row = self.get_item(item_id)
+        source = file_fingerprint(Path(row["video_path"]))
+        audio = Path(row["audio_path"]) if row["audio_path"] else None
+        fingerprint = stable_fingerprint({"source": source, "preset": row["audio_preset"], "rule": 1,
+                                          "file": file_fingerprint(audio)}) if audio and audio.is_file() else None
+        with self._lock, self.conn:
+            self.conn.execute("UPDATE media_items SET source_fingerprint=?,audio_fingerprint=?,updated_at=? WHERE id=?",
+                              (source,fingerprint,utc_now(),item_id))
 
     def get_summary(self, source_group: str | None = None) -> list[dict[str, Any]]:
         where = "WHERE source_group = ?" if source_group else ""
@@ -785,6 +999,11 @@ def cmd_extract(args: argparse.Namespace) -> int:
     audio_root = Path(args.audio_dir).resolve() / source_group
 
     db = StateDB(Path(args.db))
+    try:
+        db.require_private()
+    except ValueError:
+        db.close()
+        raise
     stop_event = threading.Event()
 
     def _handle_signal(_signum: int, _frame: Any) -> None:
@@ -809,6 +1028,10 @@ def cmd_extract(args: argparse.Namespace) -> int:
         if reset_cnt:
             print(f"Reset {reset_cnt} stale 'running' item(s) to 'pending'.", flush=True)
 
+        for item in db.get_all_group_items(source_group):
+            if item["audio_status"] == "done" and item["audio_preset"] != preset.name:
+                db.invalidate_audio(int(item["id"]), "audio preset changed")
+
         # Verify previously done items still exist on disk
         all_rows = db.get_all_group_items(source_group)
         missing_requeued = 0
@@ -828,6 +1051,14 @@ def cmd_extract(args: argparse.Namespace) -> int:
             limit=args.limit,
         )
 
+        targets: dict[str, list[int]] = {}
+        for item in all_rows:
+            target = (audio_root / Path(item["video_rel_path"])).with_suffix(preset.ext)
+            targets.setdefault(os.path.normcase(str(target)), []).append(int(item["id"]))
+        conflicts = {i for ids in targets.values() if len(ids) > 1 for i in ids}
+        for item_id in conflicts:
+            db.mark_audio_failed(item_id, "Output path collision: multiple videos produce the same audio")
+        todo_rows = [r for r in todo_rows if int(r["id"]) not in conflicts]
         total_in_group = len(all_rows)
         already_done = sum(1 for r in all_rows if r["audio_status"] == "done")
         todo_total = len(todo_rows)
@@ -845,7 +1076,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
 
         if todo_total == 0:
             print("Nothing to extract. All matching videos are already converted.", flush=True)
-            return 0
+            return 2 if conflicts else 0
 
         run_id = db.create_run(
             "extract",
@@ -861,7 +1092,7 @@ def cmd_extract(args: argparse.Namespace) -> int:
         )
 
         audio_root.mkdir(parents=True, exist_ok=True)
-        counters = {"done": 0, "failed": 0, "skipped": 0, "audio_bytes": 0}
+        counters = {"done": 0, "failed": len(conflicts), "skipped": 0, "audio_bytes": 0}
         counter_lock = threading.Lock()
         started_ts = time.monotonic()
         last_print_ts = 0.0
@@ -1238,7 +1469,15 @@ def _http_request(
             return resp.status, resp.read(), resp.headers.get("Content-Type", "")
     except urllib.error.HTTPError as e:
         err_body = e.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"HTTP {e.code} {url}: {err_body}") from e
+        retry_after = None
+        try:
+            retry_after = max(0.0, float(e.headers.get("Retry-After", "")))
+        except (ValueError, TypeError, AttributeError):
+            try:
+                retry_after = max(0.0, parsedate_to_datetime(e.headers.get("Retry-After", "")).timestamp() - time.time())
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                pass
+        raise AsrHttpError(e.code, f"HTTP {e.code} {url}: {err_body}", retry_after) from e
 
 
 def _fmt_srt_time(seconds: float) -> str:
@@ -1249,69 +1488,229 @@ def _fmt_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+class AsrProtocolError(RuntimeError):
+    pass
+
+
+class AsrHttpError(RuntimeError):
+    def __init__(self, status: int, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+class RecoverableTaskError(RuntimeError):
+    """The known remote identity must survive this local failure."""
+
+
+class SubmissionUnknownError(RecoverableTaskError):
+    pass
+
+
+class RemoteTaskFailed(RuntimeError):
+    pass
+
+
 def _extract_segments_and_text(payload: Any) -> tuple[str, list[dict[str, Any]]]:
     root = payload
-    if isinstance(root, dict):
-        for key in ("result", "data", "output"):
-            if isinstance(root.get(key), dict):
-                root = root[key]
-                break
-
-    if not isinstance(root, dict):
-        return "", []
-
+    completed = False
+    for _ in range(8):
+        if not isinstance(root, dict):
+            raise AsrProtocolError("ASR result must be an object")
+        completed = completed or str(root.get("status", root.get("state", ""))).lower() in DONE_ASR_STATUSES
+        nested = next((root[k] for k in ("result", "data", "output") if isinstance(root.get(k), dict)), None)
+        if nested is None:
+            break
+        root = nested
+    else:
+        raise AsrProtocolError("ASR result has too many nested wrappers")
     segments: list[dict[str, Any]] = []
-    raw_segs = root.get("segments") or root.get("utterances") or root.get("sentences")
-    if isinstance(raw_segs, list):
-        for seg in raw_segs:
-            if not isinstance(seg, dict):
-                continue
-            start = seg.get("start", seg.get("start_time"))
-            end = seg.get("end", seg.get("end_time"))
-            text = str(seg.get("text", seg.get("content", ""))).strip()
-            if isinstance(start, (int, float)) and isinstance(end, (int, float)) and text:
-                segments.append({"start": float(start), "end": float(end), "text": text})
 
-    if not segments and isinstance(root.get("words"), list):
-        buf_text: list[str] = []
-        buf_start: float | None = None
-        buf_end: float = 0.0
-        for w in root["words"]:
-            if not isinstance(w, dict):
-                continue
-            ws = w.get("start", w.get("start_time"))
-            we = w.get("end", w.get("end_time"))
-            wt = str(w.get("word", w.get("text", "")))
-            if not isinstance(ws, (int, float)) or not isinstance(we, (int, float)) or not wt:
-                continue
-            if buf_start is None:
-                buf_start = float(ws)
-            buf_text.append(wt)
-            buf_end = float(we)
-            joined = "".join(buf_text).strip()
-            if len(joined) >= 24 or (joined and joined[-1] in "。！？.!?") or (buf_end - buf_start) >= 6.0:
-                segments.append({"start": buf_start, "end": buf_end, "text": joined})
-                buf_text = []
-                buf_start = None
-        if buf_start is not None and buf_text:
-            segments.append({"start": buf_start, "end": buf_end, "text": "".join(buf_text).strip()})
+    def segment(item: Any, word: bool = False) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            raise AsrProtocolError("ASR segment must be an object")
+        start = item.get("start", item.get("start_time"))
+        end = item.get("end", item.get("end_time"))
+        text = item.get("word", item.get("text", "")) if word else item.get("text", item.get("content", ""))
+        if (isinstance(start, bool) or isinstance(end, bool) or not isinstance(start, (int, float))
+                or not isinstance(end, (int, float)) or not math.isfinite(start) or not math.isfinite(end)
+                or start < 0 or end < start or not isinstance(text, str)):
+            raise AsrProtocolError("ASR segment has invalid timestamps or text")
+        return {"start": float(start), "end": float(end), "text": text.strip() if not word else text}
 
-    text = str(root.get("text") or "").strip()
+    recognized = False
+    for key in ("segments", "utterances", "sentences", "chunks"):
+        if key in root:
+            recognized = True
+            if not isinstance(root[key], list):
+                raise AsrProtocolError(f"ASR {key} must be a list")
+            segments = [segment(item) for item in root[key]]
+            segments = [item for item in segments if item["text"]]
+            break
+    if not segments and "words" in root:
+        recognized = True
+        if not isinstance(root["words"], list):
+            raise AsrProtocolError("ASR words must be a list")
+        words = [segment(item, True) for item in root["words"]]
+        text_parts: list[str] = []
+        start: float | None = None
+        end = 0.0
+        for word in words:
+            if not word["text"]:
+                continue
+            if start is None:
+                start = word["start"]
+            text_parts.append(word["text"])
+            end = word["end"]
+            joined = "".join(text_parts).strip()
+            if len(joined) >= 24 or (joined and joined[-1] in "。！？.!?") or end - start >= 6:
+                segments.append({"start": start, "end": end, "text": joined})
+                text_parts, start = [], None
+        if start is not None and text_parts:
+            segments.append({"start": start, "end": end, "text": "".join(text_parts).strip()})
+    if "text" in root and not isinstance(root["text"], str):
+        raise AsrProtocolError("ASR text must be a string")
+    text = root.get("text", "").strip()
     if not text and segments:
-        text = "\n".join(s["text"] for s in segments)
+        text = "\n".join(item["text"] for item in segments)
+    if not text and not segments and "text" not in root and not (recognized and completed):
+        raise AsrProtocolError("Unrecognized or incomplete ASR result; no explicit speech result")
     return text, segments
 
 
 def _build_srt(segments: list[dict[str, Any]], fallback_text: str = "", duration_sec: float | None = None) -> str:
     if not segments:
-        if not fallback_text.strip():
-            return ""
-        end = duration_sec if duration_sec and duration_sec > 0 else 10.0
-        return f"1\n00:00:00,000 --> {_fmt_srt_time(end)}\n{fallback_text.strip()}\n"
-    blocks = []
-    for idx, seg in enumerate(segments, start=1):
-        blocks.append(f"{idx}\n{_fmt_srt_time(seg['start'])} --> {_fmt_srt_time(seg['end'])}\n{seg['text']}")
-    return "\n\n".join(blocks) + "\n"
+        return f"1\n00:00:00,000 --> 00:00:05,000\n{fallback_text.strip()}\n" if fallback_text.strip() else ""
+    return "\n\n".join(f"{i}\n{_fmt_srt_time(s['start'])} --> {_fmt_srt_time(s['end'])}\n{s['text']}"
+                       for i, s in enumerate(segments, 1)) + "\n"
+
+
+class AsrClient:
+    """The HTTP contract, error classification and result normalization in one place."""
+
+    def __init__(self, endpoint: AsrEndpointConfig, args: argparse.Namespace, stop: threading.Event,
+                 transport: Any = None, wait: Any = None) -> None:
+        self.ep = endpoint
+        self.args = args
+        self.stop = stop
+        self.transport = transport or _http_request
+        self.wait = wait or stop.wait
+
+    def request(self, method: str, route: str, **kwargs: Any) -> tuple[int, bytes, str]:
+        return self.transport(method, self.ep.base_url + route, api_key=self.ep.api_key,
+                              extra_headers=self.ep.headers, **kwargs)
+
+    def submit(self, path: Path) -> str:
+        fields = {"return_timestamps": "true"}
+        if self.ep.include_words:
+            fields["include_words"] = "true"
+        if self.args.language:
+            fields["language"] = self.args.language
+        body, content_type = _encode_multipart(fields, "file", path)
+        _, raw, _ = self.request("POST", "/v1/asr/tasks", body=body, content_type=content_type, timeout=self.args.timeout)
+        created = json.loads(raw.decode("utf-8"))
+        task_id = (created.get("task_id") or created.get("id") or (created.get("data") or {}).get("task_id")) if isinstance(created, dict) else None
+        if not isinstance(task_id, (str, int)) or not str(task_id):
+            raise AsrProtocolError("Server did not return a task_id; submission outcome needs manual verification")
+        return str(task_id)
+
+    def sync(self, path: Path) -> tuple[str, str, Any]:
+        fields = {"response_format": "json", "return_timestamps": "true"}
+        if self.ep.include_words:
+            fields["include_words"] = "true"
+        if self.args.language:
+            fields["language"] = self.args.language
+        body, content_type = _encode_multipart(fields, "file", path)
+        _, raw, _ = self.request("POST", "/v1/asr/transcribe", body=body, content_type=content_type, timeout=self.args.timeout)
+        payload = json.loads(raw.decode("utf-8"))
+        text, segments = _extract_segments_and_text(payload)
+        # Both entry points use the same local fallback instead of repeating inference for SRT.
+        return text, _build_srt(segments, text), payload
+
+    def poll(self, task_id: str, db: StateDB, item_id: int) -> tuple[str, str, Any]:
+        route = "/v1/asr/tasks/" + urllib.parse.quote(task_id, safe="")
+        deadline = time.monotonic() + self.args.task_timeout
+        errors = 0
+        while not self.stop.is_set():
+            if time.monotonic() >= deadline:
+                raise RecoverableTaskError("Local task wait elapsed; rerun to resume the same task")
+            try:
+                _, raw, _ = self.request("GET", route, timeout=min(60.0, max(0.1, deadline-time.monotonic())))
+                payload = json.loads(raw.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise AsrProtocolError("Task status must be an object")
+                errors = 0
+            except Exception as exc:
+                retryable = isinstance(exc, (TimeoutError, ConnectionError, OSError, urllib.error.URLError)) or (isinstance(exc, AsrHttpError) and (exc.status == 429 or exc.status >= 500))
+                if not retryable or errors >= self.args.poll_retries:
+                    raise RecoverableTaskError(f"Polling paused: {exc}; task identity retained. A missing/expired task requires explicit reset or overwrite.") from exc
+                delay = min(30.0, 2.0 ** errors)
+                if isinstance(exc, AsrHttpError) and exc.retry_after is not None:
+                    delay = max(delay, exc.retry_after)
+                errors += 1
+                self.wait(min(delay, max(0.0, deadline-time.monotonic())))
+                continue
+            status, progress, message = _parse_progress(payload)
+            if status in FAIL_ASR_STATUSES:
+                raise RemoteTaskFailed(str(payload.get("error") or payload.get("message") or status))
+            if status in DONE_ASR_STATUSES:
+                db.set_asr_phase(item_id, "writing")
+                text, segments = _extract_segments_and_text(payload)
+                subtitle = _build_srt(segments, text)
+                try:
+                    _, raw, _ = self.request("GET", route + "/subtitle?format=srt", timeout=60.0)
+                    if raw.strip():
+                        subtitle = raw.decode("utf-8")
+                except Exception:
+                    pass
+                return text, subtitle, payload
+            db.update_asr_progress(item_id, status="queued" if status in ("queued", "pending") else "running",
+                                   progress=progress, message=message or status, task_id=task_id)
+            self.wait(min(max(0.0, self.args.poll_interval), max(0.0, deadline-time.monotonic())))
+        raise RecoverableTaskError("Interrupted; remote task retained")
+
+    def delete(self, task_id: str) -> None:
+        try:
+            self.request("DELETE", "/v1/asr/tasks/" + urllib.parse.quote(task_id, safe=""), timeout=30.0)
+        except Exception as exc:
+            print(f"[WARN] Remote cleanup failed for {task_id}: {exc}", file=sys.stderr)
+
+
+def request_fingerprint(row: sqlite3.Row, audio: Path, ep: AsrEndpointConfig, args: argparse.Namespace) -> str:
+    return stable_fingerprint({"version": 1, "audio": row["audio_fingerprint"], "file": file_fingerprint(audio),
+        "input_path": str(audio.resolve()), "endpoint": normalize_base_url(ep.base_url), "language": args.language or None, "include_words": ep.include_words})
+
+
+def ensure_remote_task(db: StateDB, row: sqlite3.Row, client: AsrClient, fingerprint: str, overwrite: bool) -> str:
+    item_id = int(row["id"])
+    if not overwrite and row["asr_phase"] in ("submitting", "submission_unknown"):
+        db.set_asr_phase(item_id, "submission_unknown", error="Submission outcome unknown; verify before reset/overwrite (may duplicate remote work)")
+        raise SubmissionUnknownError("Submission outcome unknown; verify before reset/overwrite (may duplicate remote work)")
+    if not overwrite and row["asr_task_id"] and row["asr_status"] in ("running", "queued"):
+        if normalize_base_url(row["asr_server_url"] or "") != client.ep.base_url:
+            raise RecoverableTaskError("Remote endpoint changed; use explicit overwrite to create a replacement task")
+        if row["asr_fingerprint"] is None:
+            raise RecoverableTaskError("Legacy task request parameters are unknown; verify before explicit overwrite")
+        if row["asr_fingerprint"] == fingerprint:
+            db.set_asr_phase(item_id, "polling")
+            return str(row["asr_task_id"])
+    db.mark_asr_started(item_id, mode="async", server_url=client.ep.base_url, status="queued", message="submitting task")
+    db.set_asr_fingerprint(item_id, fingerprint)
+    try:
+        task_id = client.submit(Path(row["audio_path"]))
+    except AsrHttpError as exc:
+        # A definite client rejection did not create a task. Ambiguous responses retain submission_unknown.
+        if 400 <= exc.status < 500 and exc.status not in (408, 429):
+            db.set_asr_phase(item_id, None)
+            raise
+        db.set_asr_phase(item_id, "submission_unknown", error=str(exc))
+        raise SubmissionUnknownError(str(exc)) from exc
+    except Exception as exc:
+        db.set_asr_phase(item_id, "submission_unknown", error=str(exc))
+        raise SubmissionUnknownError(str(exc)) from exc
+    db.update_asr_progress(item_id, status="queued", progress=1.0, message="task created", task_id=task_id)
+    db.set_asr_phase(item_id, "polling")
+    return task_id
 
 
 def _parse_progress(payload: dict[str, Any]) -> tuple[str, float | None, str | None]:
@@ -1342,58 +1741,6 @@ def _parse_progress(payload: dict[str, Any]) -> tuple[str, float | None, str | N
     return raw_status, progress, str(msg) if msg is not None else None
 
 
-def _submit_async_task(
-    base_url: str,
-    audio_path: Path,
-    *,
-    language: str | None,
-    api_key: str | None,
-    extra_headers: dict[str, str] | None = None,
-    include_words: bool = False,
-    timeout: float,
-) -> str:
-    fields = {"return_timestamps": "true"}
-    if include_words:
-        fields["include_words"] = "true"
-    if language:
-        fields["language"] = language
-    body, ctype = _encode_multipart(fields, "file", audio_path)
-    _, create_bytes, _ = _http_request(
-        "POST",
-        f"{base_url}/v1/asr/tasks",
-        api_key=api_key,
-        extra_headers=extra_headers,
-        body=body,
-        content_type=ctype,
-        timeout=timeout,
-    )
-    created = json.loads(create_bytes.decode("utf-8"))
-    task_id = str(created.get("task_id") or created.get("id") or (created.get("data") or {}).get("task_id") or "")
-    if not task_id:
-        raise RuntimeError(f"Server did not return task_id: {created}")
-    return task_id
-
-
-def _delete_remote_task(
-    base_url: str,
-    task_id: str,
-    *,
-    api_key: str | None,
-    extra_headers: dict[str, str] | None = None,
-    timeout: float = 30.0,
-) -> None:
-    try:
-        _http_request(
-            "DELETE",
-            f"{base_url}/v1/asr/tasks/{urllib.parse.quote(task_id)}",
-            api_key=api_key,
-            extra_headers=extra_headers,
-            timeout=timeout,
-        )
-    except Exception as exc:
-        print(f"[WARN] Failed to DELETE remote task {task_id}: {exc}", file=sys.stderr, flush=True)
-
-
 def _resolve_transcribe_mode(row: sqlite3.Row, audio_path: Path, args: argparse.Namespace) -> tuple[str, float | None]:
     dur = row["duration_sec"]
     if dur is None:
@@ -1409,422 +1756,265 @@ def _resolve_transcribe_mode(row: sqlite3.Row, audio_path: Path, args: argparse.
 
 
 def cmd_transcribe(args: argparse.Namespace) -> int:
-    try:
-        ep = resolve_asr_endpoint(
-            endpoint=args.endpoint,
-            url=args.url,
-            api_key=args.api_key,
-            modal_key=args.modal_key,
-            modal_secret=args.modal_secret,
-            cli_headers=args.header,
-            include_words=args.include_words,
-        )
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    ep = resolve_asr_endpoint(endpoint=args.endpoint, url=args.url, api_key=args.api_key,
+        modal_key=args.modal_key, modal_secret=args.modal_secret, cli_headers=args.header, include_words=args.include_words)
+    ep = AsrEndpointConfig(ep.name, normalize_base_url(ep.base_url), ep.api_key, ep.headers, ep.include_words)
+    errors = _validate_endpoint_auth(ep)
+    if errors:
+        for error in errors:
+            print(f"Error: {error}", file=sys.stderr)
         return 1
-
-    auth_errors = _validate_endpoint_auth(ep)
-    if auth_errors:
-        for err in auth_errors:
-            print(f"Error: {err}", file=sys.stderr)
-        return 1
-
-    base_url = ep.base_url
-    api_key = ep.api_key
-    extra_headers = ep.headers
-    include_words = ep.include_words
-    transcript_root = Path(args.output_dir).resolve()
-    concurrency = max(1, int(args.concurrency))
-    prefetch = max(0, int(args.prefetch))
-    delete_remote = not args.keep_remote_task
+    if args.poll_retries < 0 or args.timeout <= 0 or args.task_timeout <= 0 or args.poll_interval < 0:
+        raise ValueError("Retry count and poll interval must be nonnegative; timeouts must be positive")
     db = StateDB(Path(args.db))
-    stop_event = threading.Event()
+    stop = threading.Event()
+    previous_handlers: dict[int, Any] = {}
 
-    def _handle_signal(_signum: int, _frame: Any) -> None:
-        if not stop_event.is_set():
-            print("\n[Interrupt] Stopping transcription after active requests settle...", flush=True)
-            stop_event.set()
+    def interrupt(_signum: int, _frame: Any) -> None:
+        print("[Interrupt] Stopping; remote tasks will remain resumable.", flush=True)
+        stop.set()
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_signal)
-
+    for sig in (signal.SIGINT, getattr(signal, "SIGTERM", signal.SIGINT)):
+        if sig not in previous_handlers and threading.current_thread() is threading.main_thread():
+            previous_handlers[sig] = signal.signal(sig, interrupt)
     try:
-        item_ids = [int(x.strip()) for x in args.ids.split(",") if x.strip()] if args.ids else None
-        rows = db.get_items_for_transcription(
-            source_group=args.group,
-            overwrite=args.overwrite,
-            retry_failed=not args.no_retry_failed,
-            item_ids=item_ids,
-            limit=args.limit,
-        )
-        total = len(rows)
-        unfinished_audio = db.count_unfinished_audio(args.group) if args.watch else 0
-        auth_tags: list[str] = []
-        if api_key:
-            auth_tags.append("Bearer")
-        for hk in sorted(extra_headers.keys()):
-            auth_tags.append(hk)
-        print(
-            f"ASR Endpoint: {ep.name} ({base_url}) | Auth: {', '.join(auth_tags) if auth_tags else 'none'} | "
-            f"Group: {args.group or 'ALL'} | Ready items: {total} | Concurrency: {concurrency} | Prefetch: {prefetch} | "
-            f"Watch: {'on' if args.watch else 'off'}"
-            + (f" (audio pending={unfinished_audio})" if args.watch else "")
-            + f" | Language: {args.language or 'auto'} | Words: {'on' if include_words else 'off'} | "
-            f"Auto-delete: {'on' if delete_remote else 'off'} | Output: {transcript_root}",
-            flush=True,
-        )
-        if total == 0 and (not args.watch or unfinished_audio == 0):
-            print("No items ready for transcription.", flush=True)
-            return 0
+        db.require_private()
+        root = Path(args.output_dir).resolve()
+        concurrency = max(1, args.concurrency)
+        capacity = concurrency + max(0, args.prefetch)
+        client = AsrClient(ep, args, stop)
+        seen: set[int] = set()
+        selected_ids = {int(i.strip()) for i in args.ids.split(",") if i.strip()} if args.ids else None
+        counts = {"done": 0, "failed": 0, "skipped": 0, "total": 0}
+        counter_lock = threading.Lock()
+        run_id = db.create_run("transcribe", args.group, {"endpoint": ep.name, "base_url": ep.base_url,
+            "mode": args.mode, "concurrency": concurrency, "prefetch": args.prefetch, "watch": args.watch,
+            "language": args.language, "include_words": ep.include_words, "output_dir": str(root),
+            "save_json": args.save_json, "delete_remote_task": not args.keep_remote_task}, 0)
+        print(f"ASR Endpoint: {ep.name} ({ep.base_url}) | Concurrency: {concurrency} | Prefetch: {args.prefetch}", flush=True)
 
-        run_id = db.create_run(
-            "transcribe",
-            args.group,
-            {
-                "endpoint": ep.name,
-                "base_url": base_url,
-                "mode": args.mode,
-                "concurrency": concurrency,
-                "prefetch": prefetch,
-                "watch": bool(args.watch),
-                "language": args.language,
-                "include_words": include_words,
-                "output_dir": str(transcript_root),
-                "save_json": args.save_json,
-                "delete_remote_task": delete_remote,
-            },
-            total,
-        )
+        def failure(row: sqlite3.Row, exc: Exception, preserve: bool = False) -> None:
+            item_id = int(row["id"])
+            current = db.get_item(item_id)
+            if preserve:
+                phase = current["asr_phase"]
+                db.set_asr_phase(item_id, phase, error=str(exc))
+            else:
+                db.mark_asr_failed(item_id, str(exc))
+                db.set_asr_phase(item_id, None, error=str(exc))
+            with counter_lock:
+                counts["failed"] += 1
+                print(f"[FAILED] {row['video_rel_path']}: {exc}", file=sys.stderr, flush=True)
 
-        counters = {"done": 0, "failed": 0, "skipped": 0, "total": total}
-        lock = threading.Lock()
-        started_ts = time.monotonic()
+        def candidates() -> list[sqlite3.Row]:
+            all_rows = db.all_items(args.group)
+            target_ids: dict[str, list[int]] = {}
+            for row in all_rows:
+                paths = build_output_paths(root, row["source_group"], row["video_rel_path"], args.save_json)
+                for target in paths.values():
+                    owners = target_ids.setdefault(os.path.normcase(str(target)), [])
+                    if int(row["id"]) not in owners:
+                        owners.append(int(row["id"]))
+            conflicts = {i for ids in target_ids.values() if len(ids) > 1 for i in ids}
+            result: list[sqlite3.Row] = []
+            for row in all_rows:
+                item_id = int(row["id"])
+                if item_id in seen or (selected_ids is not None and item_id not in selected_ids):
+                    continue
+                if args.limit and counts["total"] >= args.limit:
+                    break
+                if row["audio_status"] != "done" or not row["audio_path"]:
+                    continue
+                if item_id in conflicts:
+                    seen.add(item_id)
+                    counts["total"] += 1
+                    failure(row, ValueError("Output path collision: multiple inputs produce the same transcript"))
+                    continue
+                audio = Path(row["audio_path"])
+                if not audio.is_file() or audio.stat().st_size == 0:
+                    seen.add(item_id)
+                    counts["total"] += 1
+                    failure(row, FileNotFoundError(f"Audio missing or empty: {audio}"))
+                    continue
+                if not args.overwrite and row["asr_phase"] in ("submitting", "submission_unknown"):
+                    seen.add(item_id)
+                    counts["total"] += 1
+                    db.set_asr_phase(item_id, "submission_unknown")
+                    failure(row, SubmissionUnknownError("Submission outcome unknown; verify before explicit reset/overwrite (may duplicate work)"), True)
+                    continue
+                if row["asr_status"] == "failed" and args.no_retry_failed and not args.overwrite:
+                    continue
+                fingerprint = request_fingerprint(row, audio, ep, args)
+                if row["asr_status"] == "done" and not args.overwrite and row["asr_fingerprint"] is None:
+                    print(f"[LEGACY] {row['video_rel_path']}: result provenance unverified; use reconcile or explicit overwrite.", flush=True)
+                    seen.add(item_id)
+                    counts["skipped"] += 1
+                    continue
+                if (not args.overwrite and row["asr_task_id"] and row["asr_status"] in ("running", "queued")
+                        and (normalize_base_url(row["asr_server_url"] or "") != ep.base_url
+                             or row["asr_fingerprint"] not in (None, fingerprint))):
+                    seen.add(item_id)
+                    counts["total"] += 1
+                    failure(row, RecoverableTaskError("Active task endpoint or request differs; explicit overwrite is required to replace it"), True)
+                    continue
+                if not args.overwrite and row["asr_fingerprint"] and row["asr_fingerprint"] != fingerprint:
+                    db.invalidate_asr(item_id, "audio or request parameters changed")
+                    row = db.get_item(item_id)
+                if row["asr_status"] == "done" and not args.overwrite:
+                    store = TranscriptStore(build_output_paths(root, row["source_group"], row["video_rel_path"], args.save_json))
+                    if store.valid(file_fingerprint(audio), fingerprint):
+                        seen.add(item_id)
+                        counts["skipped"] += 1
+                        continue
+                    if args.save_json and not row["json_path"]:
+                        seen.add(item_id)
+                        counts["total"] += 1
+                        failure(row, ValueError("JSON was not saved; use explicit overwrite to regenerate raw response"), True)
+                        continue
+                    db.invalidate_asr(item_id, "output missing, changed, or not committed")
+                    row = db.get_item(item_id)
+                seen.add(item_id)
+                counts["total"] += 1
+                result.append(row)
+            return result
 
-        def _process_one(
-            row: sqlite3.Row,
-            *,
-            pre_mode: str | None = None,
-            pre_dur: float | None = None,
-            pre_task_id: str | None = None,
-        ) -> None:
-            if stop_event.is_set():
+        def process(row: sqlite3.Row, mode: str, fingerprint: str, task_id: str | None) -> None:
+            if stop.is_set():
                 return
             item_id = int(row["id"])
-            audio_path = Path(row["audio_path"])
-            if not audio_path.exists():
-                db.mark_asr_failed(item_id, f"Audio file not found: {audio_path}")
-                with lock:
-                    counters["failed"] += 1
-                return
-
-            if pre_mode is not None:
-                mode, dur = pre_mode, pre_dur
-            else:
-                mode, dur = _resolve_transcribe_mode(row, audio_path, args)
-
-            out_base = (transcript_root / row["source_group"] / row["video_rel_path"]).with_suffix("")
-            out_base.parent.mkdir(parents=True, exist_ok=True)
-            txt_path = out_base.with_suffix(".txt")
-            srt_path = out_base.with_suffix(".srt")
-            json_path = out_base.with_suffix(".json") if args.save_json else None
-            task_id: str | None = None
-
+            audio = Path(row["audio_path"])
             try:
-                if mode == "sync":
-                    db.mark_asr_started(item_id, mode="sync", server_url=base_url, status="running", progress=10.0, message="uploading")
-                    fields = {"response_format": "json", "return_timestamps": "true"}
-                    if include_words:
-                        fields["include_words"] = "true"
-                    if args.language:
-                        fields["language"] = args.language
-                    body, ctype = _encode_multipart(fields, "file", audio_path)
-                    _, raw_bytes, _ = _http_request(
-                        "POST",
-                        f"{base_url}/v1/asr/transcribe",
-                        api_key=api_key,
-                        extra_headers=extra_headers,
-                        body=body,
-                        content_type=ctype,
-                        timeout=args.timeout,
-                    )
-                    payload = json.loads(raw_bytes.decode("utf-8"))
-                    text, segments = _extract_segments_and_text(payload)
-                    if segments:
-                        srt_text = _build_srt(segments, text, dur)
-                    else:
-                        srt_fields = {"response_format": "srt", "return_timestamps": "true"}
-                        if args.language:
-                            srt_fields["language"] = args.language
-                        sbody, sctype = _encode_multipart(srt_fields, "file", audio_path)
-                        _, srt_bytes, _ = _http_request(
-                            "POST",
-                            f"{base_url}/v1/asr/transcribe",
-                            api_key=api_key,
-                            extra_headers=extra_headers,
-                            body=sbody,
-                            content_type=sctype,
-                            timeout=args.timeout,
-                        )
-                        srt_text = srt_bytes.decode("utf-8")
+                if mode == "async":
+                    task_id = task_id or ensure_remote_task(db, db.get_item(item_id), client, fingerprint, args.overwrite)
+                    text, subtitle, payload = client.poll(task_id, db, item_id)
                 else:
-                    if pre_task_id:
-                        task_id = pre_task_id
-                    else:
-                        same_server = (row["asr_server_url"] or "").rstrip("/") == base_url
-                        existing_task_id = (
-                            row["asr_task_id"]
-                            if (not args.overwrite and same_server and row["asr_status"] in ("queued", "running"))
-                            else None
-                        )
-                        task_id = existing_task_id
-                        if not task_id:
-                            db.mark_asr_started(item_id, mode="async", server_url=base_url, status="queued", progress=0.0, message="submitting task")
-                            task_id = _submit_async_task(
-                                base_url,
-                                audio_path,
-                                language=args.language,
-                                api_key=api_key,
-                                extra_headers=extra_headers,
-                                include_words=include_words,
-                                timeout=args.timeout,
-                            )
-                            db.update_asr_progress(item_id, status="queued", progress=1.0, message="task created", task_id=task_id)
-                        else:
-                            db.update_asr_progress(item_id, status="running", message="resuming task poll", task_id=task_id)
-
-                    deadline = time.monotonic() + args.task_timeout
-                    payload = {}
-                    while True:
-                        if stop_event.is_set():
-                            return
-                        if time.monotonic() > deadline:
-                            raise RuntimeError(f"Async task {task_id} timed out after {args.task_timeout}s")
-                        _, poll_bytes, _ = _http_request(
-                            "GET",
-                            f"{base_url}/v1/asr/tasks/{urllib.parse.quote(task_id)}",
-                            api_key=api_key,
-                            extra_headers=extra_headers,
-                            timeout=60.0,
-                        )
-                        payload = json.loads(poll_bytes.decode("utf-8"))
-                        raw_status, progress, msg = _parse_progress(payload)
-                        if raw_status in DONE_ASR_STATUSES:
-                            db.update_asr_progress(item_id, status="running", progress=99.0, message="downloading subtitle", task_id=task_id)
-                            break
-                        if raw_status in FAIL_ASR_STATUSES:
-                            err_msg = payload.get("error") or payload.get("message") or raw_status
-                            raise RuntimeError(f"Remote task {task_id} failed: {err_msg}")
-                        mapped_status = "queued" if raw_status in ("queued", "pending") else "running"
-                        db.update_asr_progress(item_id, status=mapped_status, progress=progress, message=msg or raw_status, task_id=task_id)
-                        time.sleep(args.poll_interval)
-
-                    text, segments = _extract_segments_and_text(payload)
-                    try:
-                        _, srt_bytes, _ = _http_request(
-                            "GET",
-                            f"{base_url}/v1/asr/tasks/{urllib.parse.quote(task_id)}/subtitle?format=srt",
-                            api_key=api_key,
-                            extra_headers=extra_headers,
-                            timeout=60.0,
-                        )
-                        srt_text = srt_bytes.decode("utf-8")
-                    except Exception:
-                        srt_text = _build_srt(segments, text, dur)
-
-                txt_path.write_text(text + ("\n" if text and not text.endswith("\n") else ""), encoding="utf-8")
-                srt_path.write_text(srt_text, encoding="utf-8")
-                if json_path is not None:
-                    json_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-
-                db.mark_asr_done(item_id, txt_path=txt_path, srt_path=srt_path, json_path=json_path)
-                if mode == "async" and delete_remote and task_id:
-                    _delete_remote_task(base_url, task_id, api_key=api_key, extra_headers=extra_headers)
-                with lock:
-                    counters["done"] += 1
-                    done_now = counters["done"] + counters["failed"]
-                    total_now = counters["total"]
-                    print(f"[{done_now}/{total_now}] DONE ({mode}) {row['video_rel_path']}", flush=True)
+                    db.mark_asr_started(item_id, mode="sync", server_url=ep.base_url, message="transcribing")
+                    db.set_asr_fingerprint(item_id, fingerprint)
+                    text, subtitle, payload = client.sync(audio)
+                source = file_fingerprint(audio)
+                # Reject an audio file replaced while this request was in flight.
+                if request_fingerprint(db.get_item(item_id), audio, ep, args) != fingerprint:
+                    raise RecoverableTaskError("Audio changed during transcription; reconcile before retry")
+                paths = build_output_paths(root, row["source_group"], row["video_rel_path"], args.save_json)
+                db.set_asr_phase(item_id, "writing")
+                TranscriptStore(paths).commit(text, subtitle, payload, source, fingerprint, str(audio.resolve()))
+                db.mark_asr_done(item_id, txt_path=paths["txt"], srt_path=paths["srt"], json_path=paths.get("json"))
+                if mode == "async" and not args.keep_remote_task and task_id:
+                    client.delete(task_id)
+                with counter_lock:
+                    counts["done"] += 1
+                    print(f"[DONE] ({mode}) {row['video_rel_path']}", flush=True)
+            except RemoteTaskFailed as exc:
+                failure(row, exc)
             except Exception as exc:
-                db.mark_asr_failed(item_id, str(exc))
-                with lock:
-                    counters["failed"] += 1
-                    print(f"[FAILED] {row['video_rel_path']}: {exc}", file=sys.stderr, flush=True)
+                failure(row, exc, bool(task_id) or isinstance(exc, RecoverableTaskError))
 
-        if prefetch > 0 or args.watch:
-            in_flight_sem = threading.Semaphore(concurrency + prefetch)
-            ready_q: queue.Queue[tuple[sqlite3.Row, str | None, float | None, str | None] | None] = queue.Queue()
-
-            def _producer() -> None:
-                seen_ids: set[int] = {int(r["id"]) for r in rows}
-                pending_batch: list[sqlite3.Row] = list(rows)
-                scheduled = 0
-                waiting_logged = False
-                try:
-                    while not stop_event.is_set():
-                        if not pending_batch:
-                            if not args.watch:
-                                break
-                            if args.limit and scheduled >= args.limit:
-                                break
-                            fetched = db.get_items_for_transcription(
-                                source_group=args.group,
-                                overwrite=args.overwrite,
-                                retry_failed=not args.no_retry_failed,
-                                item_ids=item_ids,
-                                limit=None,
-                            )
-                            new_rows = [r for r in fetched if int(r["id"]) not in seen_ids]
-                            if args.limit:
-                                remaining = max(0, args.limit - scheduled)
-                                new_rows = new_rows[:remaining]
-                            if new_rows:
-                                waiting_logged = False
-                                for r in new_rows:
-                                    seen_ids.add(int(r["id"]))
-                                with lock:
-                                    counters["total"] += len(new_rows)
-                                    total_now = counters["total"]
-                                print(f"[Watch] Discovered {len(new_rows)} new extracted audio item(s) (queued total={total_now}).", flush=True)
-                                pending_batch = new_rows
-                            else:
-                                rem_audio = db.count_unfinished_audio(args.group)
-                                if rem_audio == 0:
-                                    # Final re-check in case last audio completed right before count
-                                    fetched2 = db.get_items_for_transcription(
-                                        source_group=args.group,
-                                        overwrite=args.overwrite,
-                                        retry_failed=not args.no_retry_failed,
-                                        item_ids=item_ids,
-                                        limit=None,
-                                    )
-                                    new_rows2 = [r for r in fetched2 if int(r["id"]) not in seen_ids]
-                                    if args.limit:
-                                        new_rows2 = new_rows2[: max(0, args.limit - scheduled)]
-                                    if new_rows2:
-                                        for r in new_rows2:
-                                            seen_ids.add(int(r["id"]))
-                                        with lock:
-                                            counters["total"] += len(new_rows2)
-                                        pending_batch = new_rows2
-                                        continue
-                                    print("[Watch] All audio extraction completed and all ready items have been queued.", flush=True)
-                                    break
-                                if not waiting_logged:
-                                    print(f"[Watch] Waiting for audio extraction ({rem_audio} audio item(s) still pending/running)...", flush=True)
-                                    waiting_logged = True
-                                sleep_end = time.monotonic() + max(1.0, float(args.watch_interval))
-                                while not stop_event.is_set() and time.monotonic() < sleep_end:
-                                    time.sleep(0.5)
-                                continue
-
-                        row = pending_batch.pop(0)
-                        acquired = False
-                        while not stop_event.is_set():
-                            if in_flight_sem.acquire(timeout=0.5):
-                                acquired = True
-                                break
-                        if not acquired:
-                            break
-
-                        scheduled += 1
-                        enqueued = False
-                        try:
-                            if prefetch > 0:
-                                item_id = int(row["id"])
-                                audio_path = Path(row["audio_path"])
-                                if not audio_path.exists():
-                                    db.mark_asr_failed(item_id, f"Audio file not found: {audio_path}")
-                                    with lock:
-                                        counters["failed"] += 1
-                                        print(f"[FAILED] {row['video_rel_path']}: Audio file not found: {audio_path}", file=sys.stderr, flush=True)
-                                    continue
-
-                                mode, dur = _resolve_transcribe_mode(row, audio_path, args)
-                                if mode == "async":
-                                    same_server = (row["asr_server_url"] or "").rstrip("/") == base_url
-                                    existing_task_id = (
-                                        row["asr_task_id"]
-                                        if (not args.overwrite and same_server and row["asr_status"] in ("queued", "running"))
-                                        else None
-                                    )
-                                    if existing_task_id:
-                                        task_id = existing_task_id
-                                        db.update_asr_progress(item_id, status="running", message="resuming task poll", task_id=task_id)
-                                    else:
-                                        db.mark_asr_started(item_id, mode="async", server_url=base_url, status="queued", progress=0.0, message="uploading (prefetch)")
-                                        task_id = _submit_async_task(
-                                            base_url,
-                                            audio_path,
-                                            language=args.language,
-                                            api_key=api_key,
-                                            extra_headers=extra_headers,
-                                            include_words=include_words,
-                                            timeout=args.timeout,
-                                        )
-                                        db.update_asr_progress(item_id, status="queued", progress=1.0, message="task created", task_id=task_id)
-                                    ready_q.put((row, mode, dur, task_id))
-                                    enqueued = True
-                                else:
-                                    ready_q.put((row, mode, dur, None))
-                                    enqueued = True
-                            else:
-                                ready_q.put((row, None, None, None))
-                                enqueued = True
-                        except Exception as exc:
-                            db.mark_asr_failed(int(row["id"]), str(exc))
-                            with lock:
-                                counters["failed"] += 1
-                                print(f"[FAILED] {row['video_rel_path']}: {exc}", file=sys.stderr, flush=True)
-                        finally:
-                            if not enqueued:
-                                in_flight_sem.release()
-                finally:
-                    for _ in range(concurrency):
-                        ready_q.put(None)
-
-            def _worker() -> None:
-                while not stop_event.is_set():
-                    try:
-                        item = ready_q.get(timeout=0.5)
-                    except queue.Empty:
-                        continue
-                    if item is None:
-                        break
-                    row, mode, dur, task_id = item
-                    try:
-                        _process_one(row, pre_mode=mode, pre_dur=dur, pre_task_id=task_id)
-                    finally:
-                        in_flight_sem.release()
-
-            producer = threading.Thread(target=_producer, name="asr-producer", daemon=True)
-            workers = [threading.Thread(target=_worker, name=f"asr-worker-{i + 1}") for i in range(concurrency)]
-            producer.start()
-            for w in workers:
-                w.start()
-            producer.join()
-            for w in workers:
-                w.join()
-        else:
+        ready = candidates()
+        scheduled = 0
+        try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
-                futures = [pool.submit(_process_one, row) for row in rows]
-                for fut in concurrent.futures.as_completed(futures):
-                    fut.result()
+                futures: set[concurrent.futures.Future[None]] = set()
+                exhausted = False
+                while not stop.is_set() and (ready or futures or not exhausted):
+                    while ready and len(futures) < capacity and not stop.is_set():
+                        row = ready.pop(0)
+                        scheduled += 1
+                        try:
+                            mode, _duration = _resolve_transcribe_mode(row, Path(row["audio_path"]), args)
+                            if not args.overwrite and row["asr_task_id"] and row["asr_status"] in ("running", "queued"):
+                                mode = "async"
+                            fingerprint = request_fingerprint(row, Path(row["audio_path"]), ep, args)
+                            task_id = ensure_remote_task(db, row, client, fingerprint, args.overwrite) if args.prefetch > 0 and mode == "async" else None
+                            futures.add(pool.submit(process, row, mode, fingerprint, task_id))
+                        except Exception as exc:
+                            failure(row, exc, isinstance(exc, RecoverableTaskError))
+                    if futures:
+                        done, futures = concurrent.futures.wait(futures, timeout=0.5, return_when=concurrent.futures.FIRST_COMPLETED)
+                        for future in done:
+                            future.result()
+                    if not ready and not exhausted:
+                        if not args.watch or (args.limit and counts["total"] >= args.limit):
+                            exhausted = True
+                        else:
+                            ready = candidates()
+                            if not ready:
+                                if db.count_unfinished_audio(args.group) == 0:
+                                    ready = candidates()  # final recheck after the last extraction commit
+                                    exhausted = not ready
+                                elif not futures:
+                                    stop.wait(max(0.1, args.watch_interval))
+                # Even on interruption, consume worker exceptions and let requests settle.
+                for future in futures:
+                    future.result()
+        finally:
+            db.finish_run(run_id, done_count=counts["done"], failed_count=counts["failed"], skipped_count=counts["skipped"],
+                          status="interrupted" if stop.is_set() else "completed")
+        print(f"Transcription finished: done={counts['done']} failed={counts['failed']} skipped={counts['skipped']}", flush=True)
+        return 2 if counts["failed"] or stop.is_set() else 0
+    finally:
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+        db.close()
 
-        run_status = "interrupted" if stop_event.is_set() else "completed"
-        db.finish_run(
-            run_id,
-            done_count=counters["done"],
-            failed_count=counters["failed"],
-            skipped_count=counters["skipped"],
-            status=run_status,
-        )
-        print(
-            f"\nTranscription finished ({run_status}) in {format_duration(time.monotonic() - started_ts)}: "
-            f"done={counters['done']}, failed={counters['failed']}",
-            flush=True,
-        )
-        return 0 if counters["failed"] == 0 and not stop_event.is_set() else 2
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    db = StateDB(Path(args.db))
+    changes = 0
+    try:
+        if args.apply:
+            db.require_private()
+        if db.public_snapshot:
+            print("Public archive index: no local execution state to reconcile.")
+            return 0
+        for row in db.all_items(args.group):
+            item_id = int(row["id"])
+            action = None
+            reason = None
+            video = Path(row["video_path"])
+            audio = Path(row["audio_path"]) if row["audio_path"] else None
+            if video.is_file() and row["source_fingerprint"] and file_fingerprint(video) != row["source_fingerprint"]:
+                action, reason = "audio", "source changed"
+            elif row["audio_status"] == "done" and (not audio or not audio.is_file() or audio.stat().st_size == 0):
+                action, reason = "audio", "audio missing or empty"
+            elif row["source_fingerprint"] is None and row["audio_status"] == "done":
+                print(f"[LEGACY] {item_id} {row['video_rel_path']}: provenance unverified")
+                if args.apply and args.adopt_legacy and video.is_file():
+                    db.adopt_legacy(item_id)
+                    print("  Adopted current source/audio as a baseline; historical ASR parameters remain unverified.")
+                    changes += 1
+            if action is None and row["asr_status"] in ("done", "running", "queued", "failed") and audio and audio.is_file():
+                if row["txt_path"] and row["srt_path"]:
+                    txt, srt = Path(row["txt_path"]), Path(row["srt_path"])
+                else:
+                    paths = build_output_paths(Path(args.output_dir).resolve(), row["source_group"], row["video_rel_path"], False)
+                    txt, srt = paths["txt"], paths["srt"]
+                paths = {"txt": txt, "srt": srt, "marker": txt.with_name("." + txt.stem + ".complete.json")}
+                if row["json_path"]:
+                    paths["json"] = Path(row["json_path"])
+                store = TranscriptStore(paths)
+                if row["asr_fingerprint"] and store.valid(file_fingerprint(audio), row["asr_fingerprint"]):
+                    if row["asr_status"] != "done":
+                        action, reason = "complete", "valid committed files found"
+                elif row["asr_status"] == "done":
+                    if row["asr_fingerprint"] or not txt.is_file() or not srt.is_file():
+                        action, reason = "asr", "transcript missing, changed, or incomplete"
+                    else:
+                        print(f"[LEGACY] {item_id}: historical transcript has no completion marker; explicit overwrite verifies it.")
+            if action:
+                changes += 1
+                print(f"[{'APPLY' if args.apply else 'PLAN'}] {item_id} {row['video_rel_path']}: {reason}")
+                if args.apply:
+                    if action == "audio":
+                        db.invalidate_audio(item_id, reason)
+                    elif action == "asr":
+                        db.invalidate_asr(item_id, reason)
+                    else:
+                        marker = store.read_marker()
+                        json_file = marker.get("files", {}).get("json") if marker else None
+                        json_path = txt.parent / json_file["name"] if json_file else None
+                        db.mark_asr_done(item_id, txt_path=txt, srt_path=srt, json_path=json_path)
+        print(f"Reconcile: {changes} action(s); {'applied' if args.apply else 'dry run, use --apply to write'}.")
+        return 0
     finally:
         db.close()
 
@@ -2020,6 +2210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--no-retry-failed", action="store_true", help="Do not retry previously failed ASR items")
     p_tr.add_argument("--limit", type=int, help="Optional max items to transcribe this run")
     p_tr.add_argument("--timeout", type=float, default=300.0, help="HTTP request timeout in seconds (default: 300)")
+    p_tr.add_argument("--poll-retries", type=int, default=3, help="Consecutive transient poll retries; retain task identity when exhausted")
     p_tr.add_argument("--poll-interval", type=float, default=3.0, help="Async task poll interval in seconds (default: 3)")
     p_tr.add_argument("--task-timeout", type=float, default=7200.0, help="Async task max wait in seconds (default: 7200)")
     p_tr.set_defaults(func=cmd_transcribe)
@@ -2034,6 +2225,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_ep.add_argument("--check", action="store_true", help="Send GET /health with configured auth headers")
     p_ep.add_argument("--timeout", type=float, default=15.0, help="Health check timeout in seconds (default: 15)")
     p_ep.set_defaults(func=cmd_endpoints)
+
+    p_rec = sub.add_parser("reconcile", help="Check local files and state (dry run unless --apply)")
+    p_rec.add_argument("--group", help="Filter source group")
+    p_rec.add_argument("--apply", action="store_true", help="Apply reported state repairs")
+    p_rec.add_argument("--adopt-legacy", action="store_true", help="With --apply, adopt current source/audio metadata as an unverified legacy baseline")
+    p_rec.add_argument("--output-dir", default=str(DEFAULT_TRANSCRIPT_DIR), help="Output root for finding commits not yet stored in DB")
+    p_rec.set_defaults(func=cmd_reconcile)
 
     p_st = sub.add_parser("status", help="Show SQLite extraction and transcription progress summary")
     p_st.add_argument("--group", help="Filter by source_group")
@@ -2062,7 +2260,11 @@ def main() -> int:
     load_dotenv()
     parser = build_parser()
     args = parser.parse_args()
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except (ValueError, OSError, RuntimeError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

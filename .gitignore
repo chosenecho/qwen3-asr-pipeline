@@ -6,4 +6,11 @@ release_dist/
 *.db-shm
 __pycache__/
 *.pyc
+.archify/
+.pytest_cache/
+**/.migration-backups/
+**/.release-restore/
+release_dist.previous/
+.*.complete.json
+*.tmp-*
 

@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile, rename, rm, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -57,6 +58,7 @@ interface BatchOptions {
 	overwrite: boolean;
 	recursive: boolean;
 	saveJson: boolean;
+	keepRemoteTask: boolean;
 	language?: string;
 	asyncDurationSec: number;
 	asyncSizeMb: number;
@@ -71,6 +73,7 @@ interface FileOutcome {
 	txtPath?: string;
 	srtPath?: string;
 	jsonPath?: string;
+	warning?: string;
 	error?: string;
 }
 
@@ -260,7 +263,7 @@ async function resolveMode(filePath: string, opts: BatchOptions): Promise<"sync"
 
 function normalizeSegment(item: any): TimestampSegment | null {
 	if (!item || typeof item !== "object") return null;
-	const text = String(item.text ?? item.word ?? item.token ?? "").trim();
+	const text = String(item.text ?? item.content ?? item.word ?? item.token ?? "").trim();
 	if (!text) return null;
 
 	let start = item.start ?? item.start_time ?? item.begin ?? item.offset;
@@ -270,11 +273,11 @@ function normalizeSegment(item: any): TimestampSegment | null {
 		end = item.timestamp[1];
 	}
 
+	if (typeof start !== "number" || typeof end !== "number") return null;
 	const startNum = Number(start);
 	const endNum = Number(end);
-	if (!Number.isFinite(startNum)) return null;
-	const safeEnd = Number.isFinite(endNum) && endNum >= startNum ? endNum : startNum + 0.5;
-	return { start: Math.max(0, startNum), end: Math.max(0, safeEnd), text };
+	if (!Number.isFinite(startNum) || !Number.isFinite(endNum) || startNum < 0 || endNum < startNum) return null;
+	return { start: startNum, end: endNum, text };
 }
 
 function groupWordsToSegments(words: TimestampSegment[]): TimestampSegment[] {
@@ -292,24 +295,12 @@ function groupWordsToSegments(words: TimestampSegment[]): TimestampSegment[] {
 		currentText = "";
 	};
 
-	const needsSpace = (prev: string, next: string) =>
-		/[A-Za-z0-9]$/.test(prev) && /^[A-Za-z0-9]/.test(next);
-
 	for (let i = 0; i < words.length; i++) {
 		const w = words[i];
-		const gap = i > 0 ? w.start - words[i - 1].end : 0;
-		const shouldSplitBefore =
-			currentText.length > 0 && (gap > 0.8 || currentText.length >= 28 || w.end - currentStart >= 8);
-
-		if (shouldSplitBefore) {
-			flush();
-			currentStart = w.start;
-		}
-
-		currentText += currentText && needsSpace(currentText, w.text) ? ` ${w.text}` : w.text;
+		currentText += w.text;
 		currentEnd = w.end;
 
-		if (/[。！？!?；;.\n]$/.test(w.text)) {
+		if (currentText.trim().length >= 24 || /[。！？.!?]$/.test(currentText.trim()) || currentEnd - currentStart >= 6) {
 			flush();
 			if (i + 1 < words.length) {
 				currentStart = words[i + 1].start;
@@ -321,29 +312,41 @@ function groupWordsToSegments(words: TimestampSegment[]): TimestampSegment[] {
 }
 
 function parseAsrJson(data: any): ParsedAsrResult {
-	const payload = data?.result && typeof data.result === "object" ? data.result : data ?? {};
-
-	const rawSegments = Array.isArray(payload.segments)
-		? payload.segments
-		: Array.isArray(payload.chunks)
-			? payload.chunks
-			: [];
-	let segments = rawSegments.map(normalizeSegment).filter((s): s is TimestampSegment => s !== null);
-
-	if (segments.length === 0) {
-		const rawWords = Array.isArray(payload.words) ? payload.words : [];
-		const words = rawWords.map(normalizeSegment).filter((w): w is TimestampSegment => w !== null);
-		segments = groupWordsToSegments(words);
+	const isObject = (value: any) => value !== null && typeof value === "object" && !Array.isArray(value);
+	if (!isObject(data)) throw new Error("ASR protocol error: expected a result object");
+	let payload = data;
+	let explicitSuccess = false;
+	for (let depth = 0; depth < 16; depth++) {
+		const status = String(payload.status ?? payload.state ?? "").trim().toLowerCase();
+		if (FAIL_STATUSES.has(status) || payload.success === false) {
+			throw new Error("ASR protocol error: response reports failure");
+		}
+		explicitSuccess ||= DONE_STATUSES.has(status) || payload.success === true;
+		const wrapper = ["result", "data", "output"].find((key) => isObject(payload[key]));
+		if (!wrapper) break;
+		payload = payload[wrapper];
 	}
-
+	let segments: TimestampSegment[] = [];
+	let recognized = typeof payload.text === "string";
+	for (const key of ["segments", "utterances", "sentences", "chunks", "words"]) {
+		if (!(key in payload)) continue;
+		if (!Array.isArray(payload[key])) throw new Error(`ASR protocol error: ${key} must be an array`);
+		recognized = true;
+		const normalized = payload[key].map((item: any) => {
+			const segment = normalizeSegment(item);
+			if (segment && key === "words") segment.text = String(item.word ?? item.text ?? item.content ?? item.token ?? "");
+			return segment;
+		});
+		if (normalized.some((item: TimestampSegment | null) => item === null)) {
+			throw new Error(`ASR protocol error: invalid ${key} entry`);
+		}
+		if (segments.length === 0) segments = key === "words" ? groupWordsToSegments(normalized) : normalized;
+	}
+	if (!recognized) throw new Error("ASR protocol error: no transcript fields");
 	const directText = typeof payload.text === "string" ? payload.text.trim() : "";
-	const fallbackText = segments.map((s) => s.text).join("\n");
-
-	return {
-		text: directText || fallbackText,
-		segments,
-		raw: data,
-	};
+	const text = directText || segments.map((s) => s.text).join("\n");
+	if (!text && !explicitSuccess && typeof payload.text !== "string") throw new Error("ASR protocol error: empty result without explicit success");
+	return { text, segments, raw: data };
 }
 
 function formatSrtTime(seconds: number): string {
@@ -389,7 +392,7 @@ async function transcribeSync(
 	filePath: string,
 	opts: BatchOptions,
 	signal?: AbortSignal,
-): Promise<{ txt: string; srt: string; raw: unknown }> {
+): Promise<{ txt: string; srt: string; raw: unknown; taskId?: string }> {
 	const url = `${trimTrailingSlash(opts.baseUrl)}/v1/asr/transcribe`;
 	const headers = buildRequestHeaders(opts);
 	const form = await buildUploadForm(filePath, {
@@ -412,30 +415,8 @@ async function transcribeSync(
 
 	const json = await res.json();
 	const parsed = parseAsrJson(json);
-	let srt = segmentsToSrt(parsed.segments, parsed.text);
-
-	// Fallback: if server returned no segments/words in JSON, request SRT directly once
-	if (parsed.segments.length === 0 && parsed.text) {
-		try {
-			const srtForm = await buildUploadForm(filePath, {
-				response_format: "srt",
-				return_timestamps: "true",
-				language: opts.language,
-			});
-			const srtRes = await fetch(url, {
-				method: "POST",
-				headers,
-				body: srtForm,
-				signal,
-			});
-			if (srtRes.ok) {
-				const serverSrt = (await srtRes.text()).trim();
-				if (serverSrt) srt = `${serverSrt}\n`;
-			}
-		} catch {
-			// Keep locally generated fallback SRT
-		}
-	}
+	// Text-only responses use the shared five-second fallback without a second inference request.
+	const srt = segmentsToSrt(parsed.segments, parsed.text);
 
 	return {
 		txt: parsed.text ? `${parsed.text}\n` : "",
@@ -444,11 +425,21 @@ async function transcribeSync(
 	};
 }
 
+function taskField(payload: any, keys: string[]): any {
+	for (let depth = 0; payload && typeof payload === "object" && !Array.isArray(payload) && depth < 16; depth++) {
+		for (const key of keys) if (payload[key] !== undefined && payload[key] !== null) return payload[key];
+		const wrapper = ["result", "data", "output"].find((key) => payload[key] && typeof payload[key] === "object" && !Array.isArray(payload[key]));
+		if (!wrapper) break;
+		payload = payload[wrapper];
+	}
+	return undefined;
+}
+
 async function transcribeAsync(
 	filePath: string,
 	opts: BatchOptions,
 	signal?: AbortSignal,
-): Promise<{ txt: string; srt: string; raw: unknown }> {
+): Promise<{ txt: string; srt: string; raw: unknown; taskId?: string }> {
 	const base = trimTrailingSlash(opts.baseUrl);
 	const headers = buildRequestHeaders(opts);
 
@@ -470,7 +461,7 @@ async function transcribeAsync(
 	}
 
 	const createJson: any = await createRes.json();
-	const taskId = createJson?.task_id ?? createJson?.id ?? createJson?.data?.task_id;
+	const taskId = taskField(createJson, ["task_id", "id"]);
 	if (!taskId) {
 		throw new Error(`POST /v1/asr/tasks returned no task_id: ${JSON.stringify(createJson).slice(0, 200)}`);
 	}
@@ -494,12 +485,12 @@ async function transcribeAsync(
 		}
 		taskJson = await pollRes.json();
 
-		const status = String(taskJson?.status ?? taskJson?.state ?? "").toLowerCase();
+		const status = String(taskField(taskJson, ["status", "state"]) ?? "").trim().toLowerCase();
 		if (DONE_STATUSES.has(status)) {
 			break;
 		}
 		if (FAIL_STATUSES.has(status)) {
-			const errMsg = taskJson?.error ?? taskJson?.message ?? status;
+			const errMsg = taskField(taskJson, ["error", "message"]) ?? status;
 			throw new Error(`Task ${taskId} failed: ${String(errMsg)}`);
 		}
 
@@ -530,6 +521,7 @@ async function transcribeAsync(
 		txt: parsed.text ? `${parsed.text}\n` : "",
 		srt,
 		raw: parsed.raw,
+		taskId: String(taskId),
 	};
 }
 
@@ -558,12 +550,105 @@ async function collectAudioFiles(targetPath: string, recursive: boolean): Promis
 	return results;
 }
 
-async function fileHasContent(filePath: string): Promise<boolean> {
+interface OutputPaths {
+	txt: string;
+	srt: string;
+	json: string;
+	marker: string;
+}
+
+interface CompletionIdentity {
+	input_path: string;
+	source_fingerprint: string;
+	request_fingerprint: string;
+}
+
+function sha256(bytes: string | Uint8Array): string {
+	return createHash("sha256").update(bytes).digest("hex");
+}
+
+function buildOutputPaths(filePath: string, targetDir: string): OutputPaths {
+	const stem = path.basename(filePath, path.extname(filePath));
+	return {
+		txt: path.join(targetDir, `${stem}.txt`),
+		srt: path.join(targetDir, `${stem}.srt`),
+		json: path.join(targetDir, `${stem}.json`),
+		marker: path.join(targetDir, `.${stem}.complete.json`),
+	};
+}
+
+async function completionIdentity(filePath: string, opts: BatchOptions): Promise<CompletionIdentity> {
+	const inputPath = await realpath(filePath);
+	const info = await stat(inputPath, { bigint: true });
+	const endpoint = new URL(opts.baseUrl);
+	endpoint.hash = "";
+	return {
+		input_path: inputPath,
+		source_fingerprint: `pi-source-v1:${sha256(JSON.stringify([inputPath, String(info.size), String(info.mtimeNs)]))}`,
+		request_fingerprint: `pi-request-v1:${sha256(JSON.stringify({
+			baseUrl: trimTrailingSlash(endpoint.href), language: opts.language ?? null,
+			includeWords: opts.includeWords, contract: 1,
+		}))}`,
+	};
+}
+
+async function pathExists(filePath: string): Promise<boolean> {
+	try { await stat(filePath); return true; } catch (error: any) {
+		if (error?.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function hasValidCompletion(paths: OutputPaths, identity: CompletionIdentity, saveJson: boolean): Promise<boolean> {
 	try {
-		const info = await stat(filePath);
-		return info.isFile() && info.size > 0;
-	} catch {
-		return false;
+		const marker = JSON.parse(await readFile(paths.marker, "utf8"));
+		if (marker.schema_version !== 1 || marker.producer !== "pi" ||
+			marker.input_path !== identity.input_path ||
+			marker.source_fingerprint !== identity.source_fingerprint ||
+			marker.request_fingerprint !== identity.request_fingerprint ||
+			!marker.files || typeof marker.files !== "object" || Array.isArray(marker.files)) return false;
+		if (!marker.files.txt || !marker.files.srt || (saveJson && !marker.files.json)) return false;
+		for (const [key, entry] of Object.entries(marker.files) as [string, any][]) {
+			if (!["txt", "srt", "json"].includes(key)) return false;
+			const target = paths[key as "txt" | "srt" | "json"];
+			if (!entry || entry.name !== path.basename(target)) return false;
+			const bytes = await readFile(target);
+			if (entry.size !== bytes.length || entry.sha256 !== sha256(bytes)) return false;
+		}
+		return true;
+	} catch { return false; }
+}
+
+async function commitTranscript(
+	paths: OutputPaths, identity: CompletionIdentity,
+	result: { txt: string; srt: string; raw: unknown }, saveJson: boolean,
+): Promise<void> {
+	const contents: Record<string, string> = { txt: result.txt, srt: result.srt };
+	if (saveJson) contents.json = JSON.stringify(result.raw, null, 2);
+	const files: Record<string, { name: string; size: number; sha256: string }> = {};
+	const staged: { temp: string; target: string }[] = [];
+	const suffix = `.tmp-${randomUUID()}`;
+	try {
+		for (const [key, text] of Object.entries(contents)) {
+			const target = paths[key as "txt" | "srt" | "json"];
+			const temp = `${target}${suffix}`;
+			staged.push({ temp, target });
+			const bytes = Buffer.from(text, "utf8");
+			await writeFile(temp, bytes, { flag: "wx" });
+			const digest = sha256(bytes);
+			const written = await readFile(temp);
+			if (written.length !== bytes.length || sha256(written) !== digest) throw new Error(`Staged output verification failed: ${target}`);
+			files[key] = { name: path.basename(target), size: bytes.length, sha256: digest };
+		}
+		const markerTemp = `${paths.marker}${suffix}`;
+		staged.push({ temp: markerTemp, target: paths.marker });
+		await writeFile(markerTemp, JSON.stringify({ schema_version: 1, producer: "pi", ...identity, files }, null, 2), { flag: "wx" });
+		// Invalidate the previous generation before replacing any output. The marker commits last.
+		await rm(paths.marker, { force: true });
+		for (const item of staged) await rename(item.temp, item.target);
+		if (!await hasValidCompletion(paths, identity, saveJson)) throw new Error("Committed output verification failed");
+	} finally {
+		await Promise.all(staged.map(({ temp }) => rm(temp, { force: true }).catch(() => {})));
 	}
 }
 
@@ -585,6 +670,29 @@ async function runBatch(
 	}
 
 	const outcomes: FileOutcome[] = new Array(files.length);
+	const targets = files.map((filePath) => {
+		const relPath = path.relative(baseInputDir, filePath);
+		const targetDir = resolvedOutputDir ? path.join(resolvedOutputDir, path.dirname(relPath)) : path.dirname(filePath);
+		return buildOutputPaths(filePath, targetDir);
+	});
+	// Preflight the complete batch before starting workers or making HTTP requests.
+	const owners = new Map<string, number[]>();
+	const keyFor = (target: string) => process.platform === "win32" ? path.resolve(target).toLowerCase() : path.resolve(target);
+	for (let idx = 0; idx < targets.length; idx++) {
+		for (const target of Object.values(targets[idx])) {
+			const key = keyFor(target);
+			owners.set(key, [...(owners.get(key) ?? []), idx]);
+		}
+	}
+	const conflicts = new Set<number>();
+	for (const indices of owners.values()) {
+		if (indices.length > 1) for (const idx of indices) conflicts.add(idx);
+	}
+	// Also avoid overwriting any input (e.g. a single explicitly selected .json file).
+	const inputKeys = new Set(files.map(keyFor));
+	for (let idx = 0; idx < targets.length; idx++) {
+		if (Object.values(targets[idx]).some((target) => inputKeys.has(keyFor(target)))) conflicts.add(idx);
+	}
 	let nextIdx = 0;
 	let finished = 0;
 
@@ -596,20 +704,19 @@ async function runBatch(
 
 			const filePath = files[idx];
 			const relPath = path.relative(baseInputDir, filePath);
-			const targetDir = resolvedOutputDir
-				? path.join(resolvedOutputDir, path.dirname(relPath))
-				: path.dirname(filePath);
-			const stem = path.basename(filePath, path.extname(filePath));
-
-			const txtPath = path.join(targetDir, `${stem}.txt`);
-			const srtPath = path.join(targetDir, `${stem}.srt`);
-			const jsonPath = path.join(targetDir, `${stem}.json`);
+			const paths = targets[idx];
+			const { txt: txtPath, srt: srtPath, json: jsonPath } = paths;
 
 			try {
-				if (!opts.overwrite && (await fileHasContent(txtPath)) && (await fileHasContent(srtPath))) {
-					outcomes[idx] = { input: filePath, status: "skipped", txtPath, srtPath };
+				if (conflicts.has(idx)) throw new Error(`输出目标冲突: ${relPath}; 请分开输出目录或重命名输入`);
+				const identity = await completionIdentity(filePath, opts);
+				if (!opts.overwrite && await hasValidCompletion(paths, identity, opts.saveJson)) {
+					outcomes[idx] = { input: filePath, status: "skipped", txtPath, srtPath, jsonPath: opts.saveJson ? jsonPath : undefined };
 				} else {
-					await mkdir(targetDir, { recursive: true });
+					if (!opts.overwrite && (await Promise.all(Object.values(paths).map(pathExists))).some(Boolean)) {
+						throw new Error("已有产物缺少有效完成标记，或输入/请求/摘要已变化；请使用 --overwrite 重建");
+					}
+					await mkdir(path.dirname(txtPath), { recursive: true });
 					const chosenMode = await resolveMode(filePath, opts);
 					onProgress?.(`[${finished}/${files.length}] 正在转写 (${chosenMode}): ${relPath}`);
 
@@ -618,10 +725,20 @@ async function runBatch(
 							? await transcribeAsync(filePath, opts, signal)
 							: await transcribeSync(filePath, opts, signal);
 
-					await writeFile(txtPath, result.txt, "utf8");
-					await writeFile(srtPath, result.srt, "utf8");
-					if (opts.saveJson) {
-						await writeFile(jsonPath, JSON.stringify(result.raw, null, 2), "utf8");
+					const after = await completionIdentity(filePath, opts);
+					if (after.source_fingerprint !== identity.source_fingerprint) throw new Error("输入在转写过程中发生变化；远端任务保留");
+					await commitTranscript(paths, identity, result, opts.saveJson);
+					let cleanupWarning: string | undefined;
+					if (result.taskId && !opts.keepRemoteTask) {
+						try {
+							const deleted = await fetch(`${trimTrailingSlash(opts.baseUrl)}/v1/asr/tasks/${encodeURIComponent(result.taskId)}`, {
+								method: "DELETE", headers: buildRequestHeaders(opts), signal,
+							});
+							if (!deleted.ok && deleted.status !== 404) throw new Error(`HTTP ${deleted.status}`);
+						} catch (error) {
+							cleanupWarning = `本地产物已提交；远端任务 ${result.taskId} 清理失败: ${String(error)}`;
+							onProgress?.(cleanupWarning);
+						}
 					}
 
 					outcomes[idx] = {
@@ -631,6 +748,7 @@ async function runBatch(
 						txtPath,
 						srtPath,
 						jsonPath: opts.saveJson ? jsonPath : undefined,
+						warning: cleanupWarning,
 					};
 				}
 			} catch (err) {
@@ -683,6 +801,10 @@ function formatSummary(outcomes: FileOutcome[], baseUrl: string): string {
 		}
 	}
 
+	const warnings = outcomes.filter((item) => item.warning);
+	if (warnings.length > 0) {
+		lines.push("", "清理提示：", ...warnings.map((item) => `- ${path.basename(item.input)}: ${item.warning}`));
+	}
 	return lines.join("\n");
 }
 
@@ -786,6 +908,7 @@ function defaultOptions(overrides: Partial<BatchOptions> & { inputPath: string }
 		overwrite: overrides.overwrite ?? false,
 		recursive: overrides.recursive ?? true,
 		saveJson: overrides.saveJson ?? false,
+		keepRemoteTask: overrides.keepRemoteTask ?? false,
 		language: overrides.language ?? env.ASR_LANGUAGE,
 		asyncDurationSec: Number.isFinite(envAsyncSec) ? envAsyncSec : 150,
 		asyncSizeMb: Number.isFinite(envAsyncMb) ? envAsyncMb : 3,
@@ -854,6 +977,8 @@ function parseCommandArgs(rawArgs: string): Partial<BatchOptions> & { inputPath?
 			parsed.language = tokens[++i];
 		} else if (token.startsWith("--lang=")) {
 			parsed.language = token.slice(7);
+		} else if (token === "--keep-remote-task") {
+			parsed.keepRemoteTask = true;
 		} else if (token === "--overwrite") {
 			parsed.overwrite = true;
 		} else if (token === "--no-recursive") {
@@ -908,6 +1033,7 @@ export default function qwenAsrExtension(pi: ExtensionAPI) {
 			overwrite: Type.Optional(Type.Boolean({ description: "Overwrite existing .txt/.srt (default false)" })),
 			recursive: Type.Optional(Type.Boolean({ description: "Scan subdirectories recursively (default true)" })),
 			saveJson: Type.Optional(Type.Boolean({ description: "Also save raw timestamp JSON (default false)" })),
+			keepRemoteTask: Type.Optional(Type.Boolean({ description: "Keep completed async remote tasks after local output commit (default false)" })),
 			language: Type.Optional(Type.String({ description: "Optional language hint" })),
 		}),
 		async execute(_toolCallId: string, params: any, arg3: any, arg4: any, arg5: any) {
@@ -935,6 +1061,7 @@ export default function qwenAsrExtension(pi: ExtensionAPI) {
 					overwrite: params.overwrite,
 					recursive: params.recursive,
 					saveJson: params.saveJson,
+					keepRemoteTask: params.keepRemoteTask,
 					language: params.language,
 				},
 				cwd,
@@ -958,12 +1085,12 @@ export default function qwenAsrExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("asr", {
-		description: "批量转写音频为 .txt + .srt：/asr <文件或目录> [--endpoint local|modal] [--out DIR] [--url URL] [--mode auto|sync|async] [--concurrency N] [--json] [--overwrite]",
+		description: "批量转写音频为 .txt + .srt：/asr <文件或目录> [--endpoint local|modal] [--out DIR] [--url URL] [--mode auto|sync|async] [--concurrency N] [--json] [--overwrite] [--keep-remote-task]",
 		handler: async (args: string, ctx: any) => {
 			const parsed = parseCommandArgs(args ?? "");
 			if (!parsed.inputPath) {
 				ctx.ui.notify(
-					"用法: /asr <文件或目录> [--endpoint local|modal] [--out 输出目录] [--url http://ip:port] [--mode auto|sync|async] [--concurrency 3] [--json] [--overwrite]",
+					"用法: /asr <文件或目录> [--endpoint local|modal] [--out 输出目录] [--url http://ip:port] [--mode auto|sync|async] [--concurrency 3] [--json] [--overwrite] [--keep-remote-task]",
 					"info",
 				);
 				return;
