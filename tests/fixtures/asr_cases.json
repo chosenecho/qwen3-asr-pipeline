@@ -1,0 +1,14 @@
+[
+  {"name":"direct segments","payload":{"text":"hello","segments":[{"start":0,"end":1,"text":"hello"}]},"text":"hello","segments":[{"start":0.0,"end":1.0,"text":"hello"}]},
+  {"name":"result wrapper","payload":{"result":{"text":"hello","segments":[{"start_time":0,"end_time":1,"content":"hello"}]}},"text":"hello","segments":[{"start":0.0,"end":1.0,"text":"hello"}]},
+  {"name":"data utterances","payload":{"data":{"utterances":[{"start":0,"end":1,"text":"你好"}]}},"text":"你好","segments":[{"start":0.0,"end":1.0,"text":"你好"}]},
+  {"name":"output sentences","payload":{"output":{"sentences":[{"start":0,"end":1,"text":"hello"}]}},"text":"hello","segments":[{"start":0.0,"end":1.0,"text":"hello"}]},
+  {"name":"chunks","payload":{"chunks":[{"start":0,"end":1,"text":"hello"}]},"text":"hello","segments":[{"start":0.0,"end":1.0,"text":"hello"}]},
+  {"name":"words","payload":{"words":[{"start":0,"end":0.5,"word":"你"},{"start":0.5,"end":1,"word":"好。"}]},"text":"你好。","segments":[{"start":0.0,"end":1.0,"text":"你好。"}]},
+  {"name":"english word spaces","payload":{"words":[{"start":0,"end":0.5,"word":"hello "},{"start":0.5,"end":1,"word":"world."}]},"text":"hello world.","segments":[{"start":0.0,"end":1.0,"text":"hello world."}]},
+  {"name":"explicit empty text","payload":{"text":""},"text":"","segments":[]},
+  {"name":"successful empty segments","payload":{"status":"completed","segments":[]},"text":"","segments":[]},
+  {"name":"unrecognized object","payload":{"message":"unexpected"},"error":true},
+  {"name":"unrecognized array","payload":[],"error":true},
+  {"name":"invalid timestamps","payload":{"segments":[{"start":4,"end":1,"text":"broken"}]},"error":true}
+]
